@@ -401,6 +401,9 @@ final class Corner {
   static let savedFrame = "ctv-panel"
   // The stream that plays now, if any, and what watches it.
   private var player: AVPlayer?
+  // Gives the stream's current picture to snapshot.
+  private var videoOutput: AVPlayerItemVideoOutput?
+  private lazy var imageContext = CIContext()
   private var watchers: [NSKeyValueObservation] = []
   private var notes: [NSObjectProtocol] = []
   // The last state line sent for this stream, so a state is not sent twice.
@@ -509,6 +512,11 @@ final class Corner {
       return
     }
     let item = AVPlayerItem(url: url)
+    let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+    ])
+    item.add(videoOutput)
+    self.videoOutput = videoOutput
     let player = AVPlayer(playerItem: item)
     player.isMuted = muted
     self.player = player
@@ -583,6 +591,7 @@ final class Corner {
     player.pause()
     player.replaceCurrentItem(with: nil)
     self.player = nil
+    videoOutput = nil
     frameView.playerView.playerLayer.player = nil
     frameView.playerView.isHidden = true
     frameView.imageView.isHidden = false
@@ -602,14 +611,49 @@ final class Corner {
     report(state)
   }
 
+  // The black and white filter, when gray is on.
+  private func grayFilter() -> CIFilter? {
+    guard gray, let filter = CIFilter(name: "CIColorControls") else { return nil }
+    filter.setValue(0, forKey: kCIInputSaturationKey)
+    return filter
+  }
+
   private func applyGray() {
-    let layer = frameView.playerView.playerLayer
-    guard gray, let filter = CIFilter(name: "CIColorControls") else {
-      layer.filters = nil
+    frameView.playerView.playerLayer.filters = grayFilter().map { [$0] }
+  }
+
+  // The stream's current picture, gray when gray is on, fitted into the
+  // panel on black, as the panel shows it.
+  private func streamPicture(in rep: NSBitmapImageRep) {
+    guard let player, let videoOutput,
+      let buffer = videoOutput.copyPixelBuffer(forItemTime: player.currentTime(), itemTimeForDisplay: nil)
+    else {
+      warn("snapshot: no stream picture yet")
       return
     }
-    filter.setValue(0, forKey: kCIInputSaturationKey)
-    layer.filters = [filter]
+    var image = CIImage(cvPixelBuffer: buffer)
+    if let filter = grayFilter() {
+      filter.setValue(image, forKey: kCIInputImageKey)
+      image = filter.outputImage ?? image
+    }
+    guard let picture = imageContext.createCGImage(image, from: image.extent),
+      let context = NSGraphicsContext(bitmapImageRep: rep)?.cgContext
+    else {
+      warn("snapshot: stream picture failed")
+      return
+    }
+    // The context draws in points; the bitmap holds them at the screen's scale.
+    let width = rep.size.width
+    let height = rep.size.height
+    context.setFillColor(NSColor.black.cgColor)
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    let fit = min(width / image.extent.width, height / image.extent.height)
+    let size = CGSize(width: image.extent.width * fit, height: image.extent.height * fit)
+    context.interpolationQuality = .high
+    context.draw(
+      picture,
+      in: CGRect(x: (width - size.width) / 2, y: (height - size.height) / 2, width: size.width, height: size.height))
+    context.flush()
   }
 
   func showFrame(_ frame: CGImage) {
@@ -621,16 +665,19 @@ final class Corner {
   }
 
   private func snapshot(_ path: String) {
-    // The bitmap cannot hold the video; the stream time shows that it plays.
-    if let player {
-      warn("snapshot: the stream is not in the picture; stream time \(player.currentTime().seconds)")
-    }
     let bounds = frameView.bounds
     guard let rep = frameView.bitmapImageRepForCachingDisplay(in: bounds) else {
       warn("snapshot: no bitmap")
       return
     }
-    frameView.cacheDisplay(in: bounds, to: rep)
+    // The view cannot draw the video into a bitmap, so the picture comes from
+    // the stream. The stream time shows that it plays.
+    if let player {
+      warn("snapshot: stream time \(player.currentTime().seconds)")
+      streamPicture(in: rep)
+    } else {
+      frameView.cacheDisplay(in: bounds, to: rep)
+    }
     guard let png = rep.representation(using: .png, properties: [:]) else {
       warn("snapshot: PNG encode failed")
       return
