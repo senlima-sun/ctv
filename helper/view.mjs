@@ -26,6 +26,9 @@ const TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 // A small twitch.tv document: Twitch GQL requests run there, so they carry the
 // person's Twitch cookies.
 const TWITCH_PAGE = "https://www.twitch.tv/robots.txt";
+// The page of the live channels the person follows: its own GQL request has
+// the hash of the following query (see twitchFollowed).
+const TWITCH_FOLLOWING_PAGE = "https://www.twitch.tv/directory/following/live";
 // First path parts of twitch.tv that are not a channel.
 const TWITCH_RESERVED = new Set([
   "directory", "videos", "settings", "search", "downloads", "p", "subscriptions", "inventory", "wallet", "drops",
@@ -721,13 +724,17 @@ const TWITCH_CHANNEL = `query($login: String!) { user(login: $login) { displayNa
 const TWITCH_VIDEO = `query($id: ID!) { video(id: $id) { title owner { displayName } } }`;
 // Twitch answers "service error" for the follows of the person in a plain
 // query; its web client's own persisted query for the following page works.
-const TWITCH_FOLLOWED = {
-  operationName: "FollowingLive_CurrentUser",
+// CTV_TWITCH_FOLLOW_HASH overrides the hash of that query. When Twitch no
+// longer knows the hash, the one its following page sends replaces it for this
+// run (see twitchFollowedGql).
+const TWITCH_FOLLOWED_OPERATION = "FollowingLive_CurrentUser";
+let twitchFollowHash =
+  process.env.CTV_TWITCH_FOLLOW_HASH || "bbfa83064e90280dce3eaa9de3a18eb6647505546336313241afdf569b6b34b6";
+const twitchFollowed = () => ({
+  operationName: TWITCH_FOLLOWED_OPERATION,
   variables: { imageWidth: 50, limit: 30, includeCostreaming: false },
-  extensions: {
-    persistedQuery: { version: 1, sha256Hash: "bbfa83064e90280dce3eaa9de3a18eb6647505546336313241afdf569b6b34b6" },
-  },
-};
+  extensions: { persistedQuery: { version: 1, sha256Hash: twitchFollowHash } },
+});
 const TWITCH_SEARCH = `query($query: String!) { searchStreams(userQuery: $query, first: 15) { edges { node { title viewersCount game { displayName } broadcaster { login displayName } } } } }`;
 
 // Sends GQL requests (one batch) from a twitch.tv page, as Twitch's web
@@ -750,6 +757,57 @@ async function twitchGql(requests) {
     if (one.errors?.length) throw new Error(`Twitch: ${one.errors[0].message}`);
   }
   return { loggedIn: out.loggedIn, data: out.results.map((one) => one.data) };
+}
+
+// The following query, with the hash of the following page when Twitch does
+// not know the hash any more (a persisted-query error). One retry.
+async function twitchFollowedGql() {
+  try {
+    return await twitchGql([twitchFollowed()]);
+  } catch (err) {
+    if (!/PersistedQuery/i.test(err.message)) throw err;
+    log(`Twitch refused the following query (${err.message}); reading its hash from the following page`);
+  }
+  const hash = await findTwitchFollowHash();
+  if (!hash) throw new Error("Twitch changed its following query; update ctv.");
+  twitchFollowHash = hash;
+  return twitchGql([twitchFollowed()]);
+}
+
+// Loads the following page in a tab of its own and returns the hash of the
+// following query that the page sends (null after 15 s). A signed-out page
+// sends none.
+async function findTwitchFollowHash() {
+  const { targetId: tab } = await cdp.send("Target.createTarget", { url: "about:blank", background: true });
+  let off = () => {};
+  try {
+    const { sessionId: tabSession } = await cdp.send("Target.attachToTarget", { targetId: tab, flatten: true });
+    await cdp.send("Network.enable", {}, tabSession);
+    const hash = new Promise((resolve) => {
+      const timer = setTimeout(resolve, 15000, null);
+      off = cdp.on("Network.requestWillBeSent", ({ request }, from) => {
+        if (from !== tabSession || !request.url.startsWith("https://gql.twitch.tv/gql")) return;
+        let body;
+        try {
+          body = JSON.parse(request.postData ?? "null");
+        } catch {
+          return;
+        }
+        // One request or a batch (an array).
+        const one = [body].flat().find((op) => op?.operationName === TWITCH_FOLLOWED_OPERATION);
+        const found = one?.extensions?.persistedQuery?.sha256Hash;
+        if (!found) return;
+        clearTimeout(timer);
+        resolve(found);
+      });
+    });
+    const res = await cdp.send("Page.navigate", { url: TWITCH_FOLLOWING_PAGE }, tabSession);
+    if (res.errorText) throw new Error(`navigate failed: ${res.errorText}`);
+    return await hash;
+  } finally {
+    off();
+    await cdp.send("Target.closeTarget", { targetId: tab }).catch(() => {});
+  }
 }
 
 // The HLS URL of a Twitch channel's live stream or of a Twitch video, with the
@@ -798,9 +856,9 @@ async function findTwitchStream({ login, vod }) {
 // Live Twitch channels: the ones the person follows, or the ones that match
 // `query` (Twitch search). At most 15.
 async function listTwitch(query) {
-  const { loggedIn, data } = await twitchGql(
-    query ? [{ query: TWITCH_SEARCH, variables: { query } }] : [TWITCH_FOLLOWED],
-  );
+  const { loggedIn, data } = query
+    ? await twitchGql([{ query: TWITCH_SEARCH, variables: { query } }])
+    : await twitchFollowedGql();
   const users = query
     ? (data[0].searchStreams?.edges ?? []).map(({ node }) => node.broadcaster && { ...node.broadcaster, stream: node })
     : (data[0].currentUser?.followedLiveUsers?.edges ?? []).map(({ node }) => node);
