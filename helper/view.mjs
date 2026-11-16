@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 // view: run a headless Chrome that shows YouTube and send the page picture
-// as JPEG frames to the floating panel over a pipe (its fd 3). A YouTube live
-// video plays in the panel itself instead (its AVPlayer, from the video's HLS
-// URL): the page then goes to about:blank and no frames are sent, which costs
-// much less CPU. Zero npm dependencies (Node 22).
+// as JPEG frames to the floating panel over a pipe (its fd 3). A Twitch live
+// channel or video plays in the panel itself instead (its AVPlayer, from the
+// HLS URL that Twitch gives its web player): the page then goes to about:blank
+// and no frames are sent, which costs much less CPU. Zero npm dependencies
+// (Node 22).
 //
 // stdout: one JSON object per line (ready / nav / error).
 // stderr: diagnostics.
@@ -19,14 +20,23 @@ import { parseArgs, promisify } from "node:util";
 const CHROME_APP = "/Applications/Google Chrome.app";
 const CHROME_BIN = `${CHROME_APP}/Contents/MacOS/Google Chrome`;
 const LOGIN_URL = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
+const TWITCH_LOGIN_URL = "https://www.twitch.tv/login";
+// The Client-ID of Twitch's own web player (Streamlink sends it too).
+const TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
+// A small twitch.tv document: Twitch GQL requests run there, so they carry the
+// person's Twitch cookies.
+const TWITCH_PAGE = "https://www.twitch.tv/robots.txt";
+// First path parts of twitch.tv that are not a channel.
+const TWITCH_RESERVED = new Set([
+  "directory", "videos", "settings", "search", "downloads", "p", "subscriptions", "inventory", "wallet", "drops",
+  "friends", "messages", "payments", "prime", "turbo", "jobs", "store", "login", "signup", "logout", "popout",
+  "moderator", "embed", "broadcast", "u", "privacy", "team", "products", "bits", "following", "clips", "redeem",
+]);
 const MAX_FPS = 24;
 const CDP_TIMEOUT_MS = 10000;
 // A playing video that sends no frame for this long means Chrome stopped the
 // screencast (it waits for acks): the watchdog starts it again.
 const FRAME_STALL_MS = 3000;
-// How long POST /navigate waits for a YouTube video's player data to tell
-// whether it is live.
-const LIVE_CHECK_MS = 10000;
 // How long POST /toggle waits for the panel's answer while a stream plays.
 const PANEL_ANSWER_MS = 3000;
 // The floating panel that shows the frames: a small Swift program, built once
@@ -60,18 +70,20 @@ const { values: args } = parseArgs({
     "no-panel": { type: "boolean", default: false },
     gray: { type: "boolean", default: false },
     login: { type: "boolean", default: false },
+    "login-twitch": { type: "boolean", default: false },
   },
 });
 
 // --login: open a normal, visible Chrome window on the helper's profile so the
 // person signs in to Google once. No debugging flags: Google refuses sign-in
-// in an automated browser.
-if (args.login) {
+// in an automated browser. --login-twitch: the same window on Twitch's sign-in
+// page.
+if (args.login || args["login-twitch"]) {
   fs.mkdirSync(path.resolve(args.profile), { recursive: true });
   execFileSync("/usr/bin/open", [
     "-na", CHROME_APP, "--args",
     `--user-data-dir=${path.resolve(args.profile)}`,
-    "--no-first-run", "--no-default-browser-check", LOGIN_URL,
+    "--no-first-run", "--no-default-browser-check", args["login-twitch"] ? TWITCH_LOGIN_URL : LOGIN_URL,
   ]);
   process.exit(0);
 }
@@ -209,9 +221,9 @@ let pointerDown = false;
 let lastUrl = "";
 let lastTitle = "";
 let shuttingDown = false;
-// A live video plays in the panel (stream mode): the page is about:blank.
+// A stream plays in the panel (stream mode): the page is about:blank.
 let streaming = false;
-// The video page of the stream, to go back to when the stream fails.
+// The page of the stream, to go back to when the stream fails.
 let streamUrl = "";
 let streamLoggedIn = false;
 // Waits for the panel's answer to play / pause / toggle, oldest first.
@@ -323,16 +335,26 @@ async function attachPage() {
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: VIDEO_ONLY }, session);
 }
 
-// On a watch page the view is the video alone: the player fills the viewport
-// and the rest of the page is under it. Other pages (home, search) stay whole.
+// On a watch page (YouTube) or a channel or video page (Twitch) the view is the
+// video alone: the player fills the viewport and the rest of the page is under
+// it. Other pages (home, search) stay whole.
 const VIDEO_ONLY = `(() => {
+  const reserved = new Set(${JSON.stringify([...TWITCH_RESERVED])});
   const css = [
     "html.ctv-watch, html.ctv-watch body { overflow: hidden !important; }",
     "html.ctv-watch #movie_player { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; z-index: 2147483647 !important; background: #000 !important; }",
     "html.ctv-watch #movie_player .html5-video-container, html.ctv-watch #movie_player video { width: 100% !important; height: 100% !important; left: 0 !important; top: 0 !important; }",
     "html.ctv-watch #movie_player video { object-fit: contain !important; }",
     "html.ctv-watch #masthead-container { display: none !important; }",
+    "html.ctv-twitch, html.ctv-twitch body { overflow: hidden !important; }",
+    "html.ctv-twitch .video-player { position: fixed !important; inset: 0 !important; width: 100vw !important; height: 100vh !important; z-index: 2147483647 !important; background: #000 !important; }",
+    "html.ctv-twitch .video-player video { width: 100% !important; height: 100% !important; object-fit: contain !important; }",
   ].join("\\n");
+  const twitchPlayer = () => {
+    if (!/(^|\\.)twitch\\.tv$/.test(location.hostname)) return false;
+    const m = location.pathname.match(/^\\/(\\w+)(\\/\\d+)?\\/?$/);
+    return !!m && (m[1] === "videos" ? !!m[2] : !m[2] && !reserved.has(m[1].toLowerCase()));
+  };
   const apply = () => {
     const root = document.documentElement;
     if (!root) return;
@@ -343,6 +365,7 @@ const VIDEO_ONLY = `(() => {
       (document.head || root).appendChild(style);
     }
     root.classList.toggle("ctv-watch", location.pathname === "/watch");
+    root.classList.toggle("ctv-twitch", twitchPlayer());
     window.dispatchEvent(new Event("resize"));
   };
   // Muted is the helper's: every video that loads or plays stays silent.
@@ -355,6 +378,16 @@ const VIDEO_ONLY = `(() => {
   document.addEventListener("DOMContentLoaded", apply);
   document.addEventListener("yt-navigate-finish", apply);
   document.addEventListener("yt-page-data-updated", apply);
+  // Twitch moves between pages with history.pushState and no event: look at
+  // the path once a second.
+  if (/(^|\\.)twitch\\.tv$/.test(location.hostname)) {
+    let shown = location.pathname;
+    setInterval(() => {
+      if (location.pathname === shown) return;
+      shown = location.pathname;
+      apply();
+    }, 1000);
+  }
   apply();
 })();`;
 
@@ -602,75 +635,28 @@ function waitForLoad(timeoutMs) {
   });
 }
 
-// ---------- live streams ----------
+// ---------- streams ----------
 
-// The video id of a YouTube watch or live URL, else null.
-function youtubeVideoId(url) {
-  let u;
-  try {
-    u = new URL(url);
-  } catch {
-    return null;
-  }
-  if (!/(^|\.)youtube\.com$/.test(u.hostname)) return null;
-  if (u.pathname === "/watch") return u.searchParams.get("v");
-  return u.pathname.match(/^\/live\/([\w-]+)/)?.[1] ?? null;
-}
-
-// The player's data for video `id` (null while the player has another video
-// or none): live, its HLS URL and its title. The player's getPlayerResponse is
-// current after a YouTube navigation too; ytInitialPlayerResponse is not.
-const LIVE_STREAM = (id) => `(() => {
-  const r = document.getElementById("movie_player")?.getPlayerResponse?.();
-  const d = r?.videoDetails;
-  if (!d || d.videoId !== ${JSON.stringify(id)}) return null;
-  const hls = r.streamingData?.hlsManifestUrl || "";
-  const ended = !!r.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.endTimestamp;
-  const live = !!hls && (d.isLive === true || (d.isLiveContent === true && !ended));
-  return { live, hls, title: d.title || "" };
-})()`;
-
-// Waits for the player data of the video in `url`. Returns it when the video
-// is live, else null.
-async function findLiveStream(url) {
-  const id = youtubeVideoId(url);
-  if (!id) return null;
-  const deadline = performance.now() + LIVE_CHECK_MS;
-  while (performance.now() < deadline) {
-    let found = null;
-    try {
-      found = await evaluate(LIVE_STREAM(id));
-    } catch {}
-    if (found) return found.live ? found : null;
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  log("no player data for", id, "; showing the page");
-  return null;
-}
-
-// Stream mode: the panel plays the HLS URL, the page goes to about:blank so
-// it does not decode the video or play its sound too. The video stays the
-// page (lastUrl, lastTitle).
-async function startStream(live) {
+// Stream mode: the panel plays `stream.hls`, the page goes to about:blank so
+// it does not decode the video or play its sound too. The stream's page stays
+// the page (lastUrl, lastTitle). A new stream replaces the one that plays.
+async function startStream(stream) {
   await ensurePanel();
-  if (!panel) return false;
-  const page = await evaluate(`({ url: location.href, title: document.title })`);
-  streamUrl = page?.url || lastUrl;
-  streamLoggedIn = await isLoggedIn();
-  const title = page?.title && page.title !== "YouTube" ? page.title : live.title;
+  const wasStreaming = streaming;
+  streamUrl = stream.url;
+  streamLoggedIn = stream.loggedIn;
   toPanel(`mute ${muted ? "on" : "off"}`);
   toPanel(`gray ${gray ? "on" : "off"}`);
-  toPanel(`stream ${live.hls}`);
+  toPanel(`stream ${stream.hls}`);
   streaming = true;
   stopWatchdog();
-  if (casting) await cdp.send("Page.stopScreencast", {}, session);
-  if (streamUrl !== lastUrl || title !== lastTitle) {
-    lastUrl = streamUrl;
-    lastTitle = title;
+  if (casting && !wasStreaming) await cdp.send("Page.stopScreencast", {}, session);
+  if (stream.url !== lastUrl || stream.title !== lastTitle) {
+    lastUrl = stream.url;
+    lastTitle = stream.title;
     emit({ t: "nav", url: lastUrl, title: lastTitle });
   }
   await navigate("about:blank");
-  return true;
 }
 
 // Leaves stream mode; the page shows again when the view is cast.
@@ -686,18 +672,139 @@ async function stopStream() {
 
 async function streamFailed(message) {
   if (!streaming) return;
-  emit({ t: "error", message: `Live stream failed, playing in the page instead: ${message}` });
+  emit({ t: "error", message: `The stream failed, playing in the page instead: ${message}` });
   await stopStream();
   await navigate(streamUrl);
 }
 
-// Leaves stream mode, loads `url`, and plays it in the panel when it is a live
-// video. Returns whether it streams.
+// Loads `url`. A Twitch channel or video plays in the panel instead; it is
+// found before anything changes, so an offline channel leaves the view as it
+// is. Returns whether it streams.
 async function openUrl(url) {
-  await stopStream();
-  await navigate(url);
-  const live = args["no-panel"] ? null : await findLiveStream(url);
-  return live ? startStream(live) : false;
+  const twitch = args["no-panel"] ? null : twitchTarget(url);
+  if (!twitch) {
+    await stopStream();
+    await navigate(url);
+    return false;
+  }
+  await startStream(await findTwitchStream(twitch));
+  return true;
+}
+
+// ---------- Twitch ----------
+
+// A Twitch channel URL gives { login }, a Twitch video URL gives { vod }, any
+// other URL null.
+function twitchTarget(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  if (!/^(www\.)?twitch\.tv$/.test(u.hostname)) return null;
+  const vod = u.pathname.match(/^\/videos\/(\d+)\/?$/)?.[1];
+  if (vod) return { vod };
+  const login = u.pathname.match(/^\/(\w{1,25})\/?$/)?.[1]?.toLowerCase();
+  return login && !TWITCH_RESERVED.has(login) ? { login } : null;
+}
+
+// The query of Twitch's web player for the token and signature of a stream.
+const PLAYBACK_ACCESS_TOKEN = `query PlaybackAccessToken($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) {
+  streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature }
+  videoPlaybackAccessToken(id: $vodID, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature }
+}`;
+const TWITCH_CHANNEL = `query($login: String!) { user(login: $login) { displayName stream { title } } }`;
+const TWITCH_VIDEO = `query($id: ID!) { video(id: $id) { title owner { displayName } } }`;
+const TWITCH_STREAM_FIELDS = `login displayName stream { title viewersCount game { displayName } }`;
+const TWITCH_FOLLOWED = `query { currentUser { followedLiveUsers(first: 15) { edges { node { ${TWITCH_STREAM_FIELDS} } } } } }`;
+const TWITCH_SEARCH = `query($query: String!) { searchStreams(userQuery: $query, first: 15) { edges { node { title viewersCount game { displayName } broadcaster { login displayName } } } } }`;
+
+// Sends GQL requests (one batch) from a twitch.tv page, as Twitch's web
+// player does: with its Client-ID and, when the person is signed in, their
+// auth-token (a Turbo subscriber then gets no ads).
+const TWITCH_GQL = (requests) => `(async () => {
+  const token = (document.cookie.match(/(?:^|; )auth-token=([^;]*)/) || [])[1] || "";
+  const headers = { "Client-ID": ${JSON.stringify(TWITCH_CLIENT_ID)} };
+  if (token) headers.Authorization = "OAuth " + token;
+  const res = await fetch("https://gql.twitch.tv/gql", { method: "POST", headers, body: ${JSON.stringify(JSON.stringify(requests))} });
+  if (!res.ok) return { error: "Twitch answered " + res.status };
+  return { loggedIn: !!token, results: await res.json() };
+})()`;
+
+// Returns { loggedIn, data }: data has the data of each request, in order.
+async function twitchGql(requests) {
+  const out = await evaluateInTab(TWITCH_PAGE, TWITCH_GQL(requests));
+  if (!out || out.error) throw new Error(out?.error ?? "Twitch did not answer");
+  for (const one of out.results) {
+    if (one.errors?.length) throw new Error(`Twitch: ${one.errors[0].message}`);
+  }
+  return { loggedIn: out.loggedIn, data: out.results.map((one) => one.data) };
+}
+
+// The HLS URL of a Twitch channel's live stream or of a Twitch video, with the
+// page URL and the title. An offline channel is an error.
+async function findTwitchStream({ login, vod }) {
+  const isVod = Boolean(vod);
+  const {
+    loggedIn,
+    data: [access, info],
+  } = await twitchGql([
+    {
+      operationName: "PlaybackAccessToken",
+      query: PLAYBACK_ACCESS_TOKEN,
+      variables: { isLive: !isVod, login: login ?? "", isVod, vodID: vod ?? "", playerType: "site" },
+    },
+    isVod ? { query: TWITCH_VIDEO, variables: { id: vod } } : { query: TWITCH_CHANNEL, variables: { login } },
+  ]);
+  let token, base, url, title;
+  if (isVod) {
+    if (!info.video) throw new Error(`video ${vod} does not exist`);
+    token = access.videoPlaybackAccessToken;
+    base = `https://usher.ttvnw.net/vod/${vod}.m3u8`;
+    url = `https://www.twitch.tv/videos/${vod}`;
+    title = `${info.video.title} · ${info.video.owner?.displayName ?? "Twitch"}`;
+  } else {
+    if (!info.user) throw new Error(`${login} does not exist`);
+    if (!info.user.stream) throw new Error(`${login} is offline`);
+    token = access.streamPlaybackAccessToken;
+    base = `https://usher.ttvnw.net/api/channel/hls/${login}.m3u8`;
+    url = `https://www.twitch.tv/${login}`;
+    title = `${info.user.stream.title} · ${info.user.displayName}`;
+  }
+  if (!token) throw new Error("Twitch gave no playback token");
+  const hls =
+    `${base}?sig=${token.signature}&token=${encodeURIComponent(token.value)}` +
+    `&allow_source=true&allow_audio_only=true&fast_bread=true&p=${Math.floor(Math.random() * 1e7)}` +
+    "&player_type=site&supported_codecs=h264";
+  // Usher answers 404 for a channel that went offline after the check above.
+  const res = await fetch(hls, { signal: AbortSignal.timeout(CDP_TIMEOUT_MS) });
+  await res.body?.cancel();
+  if (res.status === 404 && !isVod) throw new Error(`${login} is offline`);
+  if (!res.ok) throw new Error(`Twitch refused the stream (${res.status})`);
+  return { hls, url, title, loggedIn };
+}
+
+// Live Twitch channels: the ones the person follows, or the ones that match
+// `query` (Twitch search). At most 15.
+async function listTwitch(query) {
+  const { loggedIn, data } = await twitchGql(
+    query ? [{ query: TWITCH_SEARCH, variables: { query } }] : [{ query: TWITCH_FOLLOWED }],
+  );
+  const users = query
+    ? (data[0].searchStreams?.edges ?? []).map(({ node }) => node.broadcaster && { ...node.broadcaster, stream: node })
+    : (data[0].currentUser?.followedLiveUsers?.edges ?? []).map(({ node }) => node);
+  const items = users
+    .filter((user) => user?.stream)
+    .slice(0, 15)
+    .map(({ login, displayName, stream }) => ({
+      id: login,
+      title: stream.title || "",
+      channel: stream.game?.displayName ? `${displayName} · ${stream.game.displayName}` : displayName,
+      length: `${stream.viewersCount.toLocaleString("en-US")} watching`,
+      url: `https://www.twitch.tv/${login}`,
+    }));
+  return { items, loggedIn };
 }
 
 // ---------- video list ----------
@@ -711,7 +818,7 @@ const LIST_VIDEOS = `(() => {
   const add = (id, title, channel, length) => {
     if (!id || !title || seen.has(id)) return;
     seen.add(id);
-    items.push({ id, title, channel: channel || "", length: length || "" });
+    items.push({ id, title, channel: channel || "", length: length || "", url: "https://www.youtube.com/watch?v=" + id });
   };
   const walk = (node, depth) => {
     if (!node || typeof node !== "object" || depth > 60) return;
@@ -745,8 +852,9 @@ const TOGGLE_PLAY = `(() => {
   return v.paused;
 })()`;
 
-// Loads `url` in a tab of its own, so a video in the view keeps playing.
-async function listVideos(url) {
+// Loads `url` in a tab of its own, so a video in the view keeps playing, and
+// returns the value of `expression` there (a promise is waited for).
+async function evaluateInTab(url, expression) {
   const { targetId: tab } = await cdp.send("Target.createTarget", { url: "about:blank", background: true });
   let off = () => {};
   try {
@@ -763,12 +871,17 @@ async function listVideos(url) {
     const res = await cdp.send("Page.navigate", { url }, tabSession);
     if (res.errorText) throw new Error(`navigate failed: ${res.errorText}`);
     await parsed;
-    const out = await cdp.send("Runtime.evaluate", { expression: LIST_VIDEOS, returnByValue: true }, tabSession);
-    return out.result?.value ?? { items: [], loggedIn: false };
+    const out = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, tabSession);
+    if (out.exceptionDetails) throw new Error(out.exceptionDetails.exception?.description ?? out.exceptionDetails.text);
+    return out.result?.value;
   } finally {
     off();
     await cdp.send("Target.closeTarget", { targetId: tab }).catch(() => {});
   }
+}
+
+async function listVideos(url) {
+  return (await evaluateInTab(url, LIST_VIDEOS)) ?? { items: [], loggedIn: false };
 }
 
 // ---------- input ----------
@@ -905,6 +1018,9 @@ async function handle(req, res) {
     case "POST /list":
       if (typeof body.url !== "string") throw new Error("url is required");
       return reply(res, 200, { ok: true, ...(await listVideos(body.url)) });
+    case "POST /twitch/list":
+      if (body.query !== undefined && typeof body.query !== "string") throw new Error("query must be a string");
+      return reply(res, 200, { ok: true, ...(await listTwitch(body.query?.trim())) });
     case "POST /gray":
       await setGray(typeof body.on === "boolean" ? body.on : !gray);
       return reply(res, 200, { ok: true, gray });
