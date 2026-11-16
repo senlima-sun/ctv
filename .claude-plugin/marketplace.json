@@ -2,13 +2,13 @@
   "name": "ctv",
   "owner": { "name": "Senlima Sun" },
   "metadata": {
-    "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide."
+    "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide. macOS only."
   },
   "plugins": [
     {
       "name": "ctv",
       "source": "./",
-      "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide.",
+      "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide. macOS only.",
       "author": { "name": "Senlima Sun" }
     }
   ]

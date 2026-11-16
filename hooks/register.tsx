@@ -72,7 +72,8 @@ const CAST_TIMEOUT_MS = 200_000
 const searchUrl = (text: string) =>
   `https://www.youtube.com/results?search_query=${encodeURIComponent(text)}`
 
-const siteOf = (url: string): Site => (/^https?:\/\/([^/]+\.)?twitch\.tv\//i.test(url) ? 'Twitch' : 'YouTube')
+const siteOf = (url: string): Site =>
+  /^https?:\/\/([^/]+\.)?twitch\.tv\//i.test(url) ? 'Twitch' : 'YouTube'
 
 const randomHex = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(4)), byte =>
@@ -448,8 +449,12 @@ async function listStreaming($: EngineInterface) {
     return
   }
   $.ui.log('ctv: loading who is live now…')
-  const youtube = accounts.youtube ? await fetchList($, listFor('YouTube', { verb: 'streaming' }).request) : []
-  const twitch = accounts.twitch ? await fetchList($, listFor('Twitch', { verb: 'streaming' }).request) : []
+  const youtube = accounts.youtube
+    ? await fetchList($, listFor('YouTube', { verb: 'streaming' }).request)
+    : []
+  const twitch = accounts.twitch
+    ? await fetchList($, listFor('Twitch', { verb: 'streaming' }).request)
+    : []
   const tagged = [
     ...(youtube ?? []).map(video => ({ video, tag: '[YT] ' })),
     ...(twitch ?? []).map(video => ({ video, tag: '[TH] ' })),

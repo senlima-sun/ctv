@@ -2,30 +2,32 @@
 
 A Claude Code mod that plays a small live video in a floating panel at the bottom-right of your Mac screen while you work. It lists and plays YouTube (your home feed, a search, or any link) through a headless Google Chrome that uses your own Google sign-in, and Twitch (the live channels you follow, a search, live streams and past broadcasts) played natively in the panel. You control it with `/ctv` commands in Claude Code.
 
-| Command | What it does |
-| --- | --- |
-| `/ctv` | When a video is loaded, hide or show the panel; else list the start of a site (YouTube home, Twitch follow) |
-| `/ctv yt`, `/ctv youtube` | List your YouTube home feed |
-| `/ctv th`, `/ctv twitch` | List the Twitch channels you follow that are live |
-| `/ctv [yt \| th] search <text>` | Search; all the text after `search` is the query |
-| `/ctv [yt \| th] <text>` | Search, the same as `search <text>` |
-| `/ctv [yt \| th] follow` | YouTube: your subscriptions feed; Twitch: the channels you follow that are live |
-| `/ctv yt streaming`, `/ctv th streaming` | The channels you follow on that site that are live now |
-| `/ctv streaming` | Who is live now on every site you are signed in to, in one list |
-| `/ctv <number>` | Play that item from the last list |
-| `/ctv <url>` | Play a YouTube or Twitch link |
-| `/ctv pause` | Play or pause |
-| `/ctv mute`, `/ctv unmute` | Sound off or on |
-| `/ctv bigger`, `/ctv smaller` | Resize the panel |
-| `/ctv gray` | Black and white on or off |
-| `/ctv off` | Stop and close the panel |
-| `/ctv login [yt \| th]` | Open Chrome to sign in to Google (`yt`) or Twitch (`th`); with no site, ctv asks which |
+macOS only (it uses a native AppKit panel and AVPlayer).
+
+| Command                                  | What it does                                                                                                |
+| ---------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `/ctv`                                   | When a video is loaded, hide or show the panel; else list the start of a site (YouTube home, Twitch follow) |
+| `/ctv yt`, `/ctv youtube`                | List your YouTube home feed                                                                                 |
+| `/ctv th`, `/ctv twitch`                 | List the Twitch channels you follow that are live                                                           |
+| `/ctv [yt \| th] search <text>`          | Search; all the text after `search` is the query                                                            |
+| `/ctv [yt \| th] <text>`                 | Search, the same as `search <text>`                                                                         |
+| `/ctv [yt \| th] follow`                 | YouTube: your subscriptions feed; Twitch: the channels you follow that are live                             |
+| `/ctv yt streaming`, `/ctv th streaming` | The channels you follow on that site that are live now                                                      |
+| `/ctv streaming`                         | Who is live now on every site you are signed in to, in one list                                             |
+| `/ctv <number>`                          | Play that item from the last list                                                                           |
+| `/ctv <url>`                             | Play a YouTube or Twitch link                                                                               |
+| `/ctv pause`                             | Play or pause                                                                                               |
+| `/ctv mute`, `/ctv unmute`               | Sound off or on                                                                                             |
+| `/ctv bigger`, `/ctv smaller`            | Resize the panel                                                                                            |
+| `/ctv gray`                              | Black and white on or off                                                                                   |
+| `/ctv off`                               | Stop and close the panel                                                                                    |
+| `/ctv login [yt \| th]`                  | Open Chrome to sign in to Google (`yt`) or Twitch (`th`); with no site, ctv asks which                      |
 
 With no site named, ctv uses the site you are signed in to. When you are signed in to both or to neither, it asks which site. Replies show in the transcript only; they are not sent to Claude.
 
 ## Requirements
 
-- macOS
+- macOS (the only supported platform)
 - Google Chrome in `/Applications`
 - Node.js 20.11 or newer on your `PATH` as `node`
 - Xcode Command Line Tools, for `swiftc` (`xcode-select --install`)
@@ -67,6 +69,16 @@ claude plugin uninstall ctv@ctv
 claude plugin marketplace remove ctv
 rm -rf ~/Library/Application\ Support/ctv
 ```
+
+## Development
+
+```
+npm install
+npm run check
+claude plugin test .
+```
+
+`npm install` gets the dev tools only (oxlint and oxfmt); the mod has no runtime dependencies. `npm run fmt` formats the files.
 
 ## Notes
 

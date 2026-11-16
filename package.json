@@ -1,0 +1,14 @@
+{
+  "name": "ctv",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint",
+    "fmt": "oxfmt",
+    "check": "oxfmt --check && oxlint"
+  },
+  "devDependencies": {
+    "oxfmt": "0.78.0",
+    "oxlint": "1.93.0"
+  }
+}

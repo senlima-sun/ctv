@@ -4,7 +4,7 @@ export type Video = { id: string; title: string; channel: string; length: string
 
 declare module 'claude-code' {
   interface PluginState {
-    'ctv': {
+    ctv: {
       running: boolean
       shown: boolean
       title: string

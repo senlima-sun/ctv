@@ -59,9 +59,10 @@ test('/ctv lists, plays by number, hides, lists home and pauses', async ($, on) 
     const path = e.url.replace('http://ctv', '')
     const count = fetches.filter(one => one.url === e.url).length
     waiters.get(`${path}#${count}`)?.()
-    const text = path === '/list'
-      ? '{"ok":true,"loggedIn":true,"items":[{"id":"abc","title":"Cat","channel":"C","length":"1:00","url":"https://www.youtube.com/watch?v=abc"}]}'
-      : '{}'
+    const text =
+      path === '/list'
+        ? '{"ok":true,"loggedIn":true,"items":[{"id":"abc","title":"Cat","channel":"C","length":"1:00","url":"https://www.youtube.com/watch?v=abc"}]}'
+        : '{}'
 
     return { value: { status: 200, ok: true, headers: {}, text } }
   })
@@ -96,7 +97,9 @@ test('/ctv lists, plays by number, hides, lists home and pauses', async ($, on) 
   expect(body(last('/list'))).toEqual({
     url: 'https://www.youtube.com/results?search_query=cats',
   })
-  expect(logs.some(line => line.includes('Cat') && line.includes('https://www.youtube.com/watch?v=abc'))).toBe(true)
+  expect(
+    logs.some(line => line.includes('Cat') && line.includes('https://www.youtube.com/watch?v=abc')),
+  ).toBe(true)
 
   // A number plays that item: the page goes there and the helper shows its window.
   await $.command.run({ ...RUN, args: '1' })
@@ -209,7 +212,9 @@ test('/ctv twitch lists who you follow, plays by number, searches and asks to si
   await $.command.run({ ...RUN, args: 'twitch' })
   await followedShown
   expect(body(last('/twitch/list'))).toEqual({})
-  expect(logs.some(line => line.includes('Cat stream') && line.includes('https://www.twitch.tv/cat'))).toBe(true)
+  expect(
+    logs.some(line => line.includes('Cat stream') && line.includes('https://www.twitch.tv/cat')),
+  ).toBe(true)
 
   // A number plays the item's own URL.
   await $.command.run({ ...RUN, args: '1' })
@@ -280,17 +285,21 @@ test('/ctv aliases, follow, search and the site question', async ($, on) => {
   on('http.fetch', (_, e) => {
     fetches.push(e as Fetch)
     const path = e.url.replace('http://ctv', '')
-    const sent = e.init?.body === undefined ? {} : (JSON.parse(String(e.init.body)) as { live?: boolean; query?: string })
+    const sent =
+      e.init?.body === undefined
+        ? {}
+        : (JSON.parse(String(e.init.body)) as { live?: boolean; query?: string })
     // A live list holds one item on each site; every other list holds none.
-    const text = path === '/accounts'
-      ? JSON.stringify({ ok: true, ...accounts })
-      : path === '/list'
-        ? sent.live === true
-          ? '{"ok":true,"loggedIn":true,"items":[{"id":"yl","title":"YT live","channel":"Y","length":"","url":"https://www.youtube.com/watch?v=yl"}]}'
-          : '{"ok":true,"loggedIn":false,"items":[]}'
-        : path === '/twitch/list' && sent.query === undefined
-          ? '{"ok":true,"loggedIn":true,"items":[{"id":"tl","title":"TH live","channel":"T","length":"5 watching","url":"https://www.twitch.tv/tl"}]}'
-          : '{"ok":true,"items":[]}'
+    const text =
+      path === '/accounts'
+        ? JSON.stringify({ ok: true, ...accounts })
+        : path === '/list'
+          ? sent.live === true
+            ? '{"ok":true,"loggedIn":true,"items":[{"id":"yl","title":"YT live","channel":"Y","length":"","url":"https://www.youtube.com/watch?v=yl"}]}'
+            : '{"ok":true,"loggedIn":false,"items":[]}'
+          : path === '/twitch/list' && sent.query === undefined
+            ? '{"ok":true,"loggedIn":true,"items":[{"id":"tl","title":"TH live","channel":"T","length":"5 watching","url":"https://www.twitch.tv/tl"}]}'
+            : '{"ok":true,"items":[]}'
     settle()
 
     return { value: { status: 200, ok: true, headers: {}, text } }
@@ -305,7 +314,15 @@ test('/ctv aliases, follow, search and the site question', async ($, on) => {
     runs.push(e.argv)
     settle()
 
-    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    return {
+      value: {
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        isStdoutTruncated: false,
+        isStderrTruncated: false,
+      },
+    }
   })
 
   const body = (one: Fetch | undefined) => JSON.parse(String(one?.init?.body)) as unknown
@@ -371,13 +388,19 @@ test('/ctv aliases, follow, search and the site question', async ($, on) => {
   // `yt streaming` lists only the YouTube subscriptions that are live.
   await $.command.run({ ...RUN, args: 'yt streaming' })
   await after('/list', 5)
-  expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/feed/subscriptions', live: true })
+  expect(body(last('/list'))).toEqual({
+    url: 'https://www.youtube.com/feed/subscriptions',
+    live: true,
+  })
 
   // `streaming` with no site asks nothing and lists both sites, numbered across both.
   await $.command.run({ ...RUN, args: 'streaming' })
   await until(() => logs.some(line => line.includes('[TH] TH live')))
   expect(questions).toHaveLength(2)
-  expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/feed/subscriptions', live: true })
+  expect(body(last('/list'))).toEqual({
+    url: 'https://www.youtube.com/feed/subscriptions',
+    live: true,
+  })
   expect(posts('/list')).toHaveLength(6)
   expect(body(last('/twitch/list'))).toEqual({})
   const heading = logs.lastIndexOf('Live now · /ctv <number> plays one')

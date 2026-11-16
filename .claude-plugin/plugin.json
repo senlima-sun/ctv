@@ -1,7 +1,7 @@
 {
   "name": "ctv",
   "version": "0.1.0",
-  "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide.",
+  "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide. macOS only.",
   "author": { "name": "Senlima Sun" },
   "icon": "./.claude-plugin/icon.png",
   "types": "./types/index.d.ts"

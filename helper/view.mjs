@@ -17,6 +17,12 @@ import os from "node:os";
 import path from "node:path";
 import { parseArgs, promisify } from "node:util";
 
+// The panel is AppKit and AVPlayer, and Chrome is found in /Applications.
+if (process.platform !== "darwin") {
+  emit({ t: "error", message: "ctv supports macOS only." });
+  process.exit(2);
+}
+
 const CHROME_APP = "/Applications/Google Chrome.app";
 const CHROME_BIN = `${CHROME_APP}/Contents/MacOS/Google Chrome`;
 const LOGIN_URL = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
@@ -31,9 +37,38 @@ const TWITCH_PAGE = "https://www.twitch.tv/robots.txt";
 const TWITCH_FOLLOWING_PAGE = "https://www.twitch.tv/directory/following/live";
 // First path parts of twitch.tv that are not a channel.
 const TWITCH_RESERVED = new Set([
-  "directory", "videos", "settings", "search", "downloads", "p", "subscriptions", "inventory", "wallet", "drops",
-  "friends", "messages", "payments", "prime", "turbo", "jobs", "store", "login", "signup", "logout", "popout",
-  "moderator", "embed", "broadcast", "u", "privacy", "team", "products", "bits", "following", "clips", "redeem",
+  "directory",
+  "videos",
+  "settings",
+  "search",
+  "downloads",
+  "p",
+  "subscriptions",
+  "inventory",
+  "wallet",
+  "drops",
+  "friends",
+  "messages",
+  "payments",
+  "prime",
+  "turbo",
+  "jobs",
+  "store",
+  "login",
+  "signup",
+  "logout",
+  "popout",
+  "moderator",
+  "embed",
+  "broadcast",
+  "u",
+  "privacy",
+  "team",
+  "products",
+  "bits",
+  "following",
+  "clips",
+  "redeem",
 ]);
 const MAX_FPS = 24;
 const CDP_TIMEOUT_MS = 10000;
@@ -84,9 +119,13 @@ const { values: args } = parseArgs({
 if (args.login || args["login-twitch"]) {
   fs.mkdirSync(path.resolve(args.profile), { recursive: true });
   execFileSync("/usr/bin/open", [
-    "-na", CHROME_APP, "--args",
+    "-na",
+    CHROME_APP,
+    "--args",
     `--user-data-dir=${path.resolve(args.profile)}`,
-    "--no-first-run", "--no-default-browser-check", args["login-twitch"] ? TWITCH_LOGIN_URL : LOGIN_URL,
+    "--no-first-run",
+    "--no-default-browser-check",
+    args["login-twitch"] ? TWITCH_LOGIN_URL : LOGIN_URL,
   ]);
   process.exit(0);
 }
@@ -237,9 +276,13 @@ let panelAnswers = [];
 function userAgent() {
   let version = "157.0.0.0";
   try {
-    version = execFileSync("/usr/bin/plutil", ["-extract", "CFBundleShortVersionString", "raw", `${CHROME_APP}/Contents/Info.plist`], {
-      encoding: "utf8",
-    }).trim();
+    version = execFileSync(
+      "/usr/bin/plutil",
+      ["-extract", "CFBundleShortVersionString", "raw", `${CHROME_APP}/Contents/Info.plist`],
+      {
+        encoding: "utf8",
+      },
+    ).trim();
   } catch {}
   const major = version.split(".")[0];
   return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
@@ -334,7 +377,11 @@ async function attachPage() {
   await cdp.send("Target.setDiscoverTargets", { discover: true });
   await cdp.send("Page.enable", {}, session);
   await cdp.send("Runtime.enable", {}, session);
-  await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: scale, mobile: false }, session);
+  await cdp.send(
+    "Emulation.setDeviceMetricsOverride",
+    { width, height, deviceScaleFactor: scale, mobile: false },
+    session,
+  );
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: VIDEO_ONLY }, session);
 }
 
@@ -433,7 +480,9 @@ async function ensurePanel() {
     fs.mkdirSync(path.dirname(PANEL_BIN), { recursive: true });
     await promisify(execFile)("/usr/bin/swiftc", ["-O", PANEL_SRC, "-o", PANEL_BIN], { timeout: 180000 });
   }
-  const child = spawn(PANEL_BIN, ["--width", String(width), "--height", String(height)], { stdio: ["pipe", "pipe", "pipe", "pipe"] });
+  const child = spawn(PANEL_BIN, ["--width", String(width), "--height", String(height)], {
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+  });
   child.stderr.on("data", (d) => process.stderr.write(d));
   let rest = "";
   child.stdout.setEncoding("utf8");
@@ -544,7 +593,13 @@ async function startScreencast() {
     try {
       await cdp.send(
         "Page.startScreencast",
-        { format: "jpeg", quality: 80, maxWidth: Math.round(width * scale), maxHeight: Math.round(height * scale), everyNthFrame: 1 },
+        {
+          format: "jpeg",
+          quality: 80,
+          maxWidth: Math.round(width * scale),
+          maxHeight: Math.round(height * scale),
+          everyNthFrame: 1,
+        },
         session,
       );
       return;
@@ -876,7 +931,7 @@ async function listTwitch(query) {
     : (data[0].currentUser?.followedLiveUsers?.edges ?? []).map(({ node }) => node);
   const items = users
     .filter((user) => user?.stream)
-    .sort((a, b) => b.stream.viewersCount - a.stream.viewersCount)
+    .toSorted((a, b) => b.stream.viewersCount - a.stream.viewersCount)
     .slice(0, 15)
     .map(({ login, displayName, stream }) => ({
       id: login,
@@ -994,23 +1049,55 @@ const NAMED_KEYS = {
   end: { key: "End", code: "End", vk: 35 },
   delete: { key: "Delete", code: "Delete", vk: 46 },
 };
-const KEY_ALIASES = { arrowup: "up", arrowdown: "down", arrowleft: "left", arrowright: "right", esc: "escape", del: "delete" };
+const KEY_ALIASES = {
+  arrowup: "up",
+  arrowdown: "down",
+  arrowleft: "left",
+  arrowright: "right",
+  esc: "escape",
+  del: "delete",
+};
 
 const PUNCT_CODES = {
-  "-": ["Minus", 189], "_": ["Minus", 189], "=": ["Equal", 187], "+": ["Equal", 187],
-  "[": ["BracketLeft", 219], "{": ["BracketLeft", 219], "]": ["BracketRight", 221], "}": ["BracketRight", 221],
-  "\\": ["Backslash", 220], "|": ["Backslash", 220], ";": ["Semicolon", 186], ":": ["Semicolon", 186],
-  "'": ["Quote", 222], '"': ["Quote", 222], ",": ["Comma", 188], "<": ["Comma", 188],
-  ".": ["Period", 190], ">": ["Period", 190], "/": ["Slash", 191], "?": ["Slash", 191],
-  "`": ["Backquote", 192], "~": ["Backquote", 192],
-  "!": ["Digit1", 49], "@": ["Digit2", 50], "#": ["Digit3", 51], "$": ["Digit4", 52], "%": ["Digit5", 53],
-  "^": ["Digit6", 54], "&": ["Digit7", 55], "*": ["Digit8", 56], "(": ["Digit9", 57], ")": ["Digit0", 48],
+  "-": ["Minus", 189],
+  _: ["Minus", 189],
+  "=": ["Equal", 187],
+  "+": ["Equal", 187],
+  "[": ["BracketLeft", 219],
+  "{": ["BracketLeft", 219],
+  "]": ["BracketRight", 221],
+  "}": ["BracketRight", 221],
+  "\\": ["Backslash", 220],
+  "|": ["Backslash", 220],
+  ";": ["Semicolon", 186],
+  ":": ["Semicolon", 186],
+  "'": ["Quote", 222],
+  '"': ["Quote", 222],
+  ",": ["Comma", 188],
+  "<": ["Comma", 188],
+  ".": ["Period", 190],
+  ">": ["Period", 190],
+  "/": ["Slash", 191],
+  "?": ["Slash", 191],
+  "`": ["Backquote", 192],
+  "~": ["Backquote", 192],
+  "!": ["Digit1", 49],
+  "@": ["Digit2", 50],
+  "#": ["Digit3", 51],
+  $: ["Digit4", 52],
+  "%": ["Digit5", 53],
+  "^": ["Digit6", 54],
+  "&": ["Digit7", 55],
+  "*": ["Digit8", 56],
+  "(": ["Digit9", 57],
+  ")": ["Digit0", 48],
 };
 
 function describeKey(raw) {
   if ([...raw].length === 1 && raw !== " ") {
     const ch = raw;
-    if (/^[a-z]$/i.test(ch)) return { key: ch, code: `Key${ch.toUpperCase()}`, vk: ch.toUpperCase().charCodeAt(0), text: ch };
+    if (/^[a-z]$/i.test(ch))
+      return { key: ch, code: `Key${ch.toUpperCase()}`, vk: ch.toUpperCase().charCodeAt(0), text: ch };
     if (/^[0-9]$/.test(ch)) return { key: ch, code: `Digit${ch}`, vk: ch.charCodeAt(0), text: ch };
     const p = PUNCT_CODES[ch];
     return { key: ch, code: p ? p[0] : "", vk: p ? p[1] : 0, text: ch };
@@ -1027,7 +1114,11 @@ async function sendKey(ev) {
   const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, modifiers };
   const typesText = k.text && !ev.ctrl && !ev.meta;
   if (typesText) {
-    await cdp.send("Input.dispatchKeyEvent", { ...base, type: "keyDown", text: k.text, unmodifiedText: k.text }, session);
+    await cdp.send(
+      "Input.dispatchKeyEvent",
+      { ...base, type: "keyDown", text: k.text, unmodifiedText: k.text },
+      session,
+    );
   } else {
     await cdp.send("Input.dispatchKeyEvent", { ...base, type: "rawKeyDown" }, session);
   }
@@ -1040,10 +1131,18 @@ async function sendInput(ev) {
     const y = Number(ev.y) * height;
     if (ev.type === "down") {
       pointerDown = true;
-      await cdp.send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 }, session);
+      await cdp.send(
+        "Input.dispatchMouseEvent",
+        { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 },
+        session,
+      );
     } else if (ev.type === "up") {
       pointerDown = false;
-      await cdp.send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 }, session);
+      await cdp.send(
+        "Input.dispatchMouseEvent",
+        { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 },
+        session,
+      );
     } else if (ev.type === "move") {
       await cdp.send(
         "Input.dispatchMouseEvent",
@@ -1056,7 +1155,11 @@ async function sendInput(ev) {
   } else if (ev.k === "wheel") {
     const x = Number(ev.x) * width;
     const y = Number(ev.y) * height;
-    await cdp.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: 0, deltaY: Number(ev.dy) || 0 }, session);
+    await cdp.send(
+      "Input.dispatchMouseEvent",
+      { type: "mouseWheel", x, y, deltaX: 0, deltaY: Number(ev.dy) || 0 },
+      session,
+    );
   } else if (ev.k === "key") {
     await sendKey(ev);
   } else {

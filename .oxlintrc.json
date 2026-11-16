@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": { "correctness": "error", "suspicious": "error" },
+  "ignorePatterns": [".claude-plugin/types/**", "node_modules/**"],
+  "rules": {
+    // Misfires on `let done = () => {}` placeholders that a Promise executor reassigns.
+    "unicorn/consistent-function-scoping": "off",
+    // Misfires on `[...checks]` copies taken because the loop body splices the array.
+    "unicorn/no-useless-spread": "off"
+  },
+  "overrides": [
+    { "files": ["helper/**/*.mjs"], "env": { "node": true, "es2024": true } },
+    { "files": ["hooks/**/*.tsx", "types/**/*.ts"], "env": { "es2024": true } }
+  ]
+}
