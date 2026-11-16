@@ -812,10 +812,14 @@ async function listTwitch(query) {
 
 // ---------- video list ----------
 
-// Reads the videos a YouTube page (home, search) holds in `ytInitialData`:
-// the page's own data, there before anything is drawn.
-const LIST_VIDEOS = `(() => {
+// Reads the videos a YouTube page (home, search, subscriptions) holds in
+// `ytInitialData`: the page's own data, there before anything is drawn. With
+// `live`, only the items marked live now.
+const LIST_VIDEOS = (live) => `((live) => {
   const items = [];
+  // A live-now badge or overlay anywhere in the item's own data.
+  const isLive = (item) =>
+    /"(BADGE_STYLE_TYPE_LIVE_NOW|THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE)"|"style":"LIVE"/.test(JSON.stringify(item));
   const seen = new Set();
   const text = (t) => (!t ? "" : t.simpleText ?? t.content ?? (t.runs || []).map((r) => r.text).join(""));
   const add = (id, title, channel, length) => {
@@ -830,9 +834,9 @@ const LIST_VIDEOS = `(() => {
       return;
     }
     const v = node.videoRenderer || node.compactVideoRenderer;
-    if (v && v.videoId) add(v.videoId, text(v.title), text(v.ownerText || v.longBylineText || v.shortBylineText), text(v.lengthText));
+    if (v && v.videoId && (!live || isLive(v))) add(v.videoId, text(v.title), text(v.ownerText || v.longBylineText || v.shortBylineText), text(v.lengthText));
     const l = node.lockupViewModel;
-    if (l && l.contentType === "LOCKUP_CONTENT_TYPE_VIDEO") {
+    if (l && l.contentType === "LOCKUP_CONTENT_TYPE_VIDEO" && (!live || isLive(l))) {
       const m = l.metadata && l.metadata.lockupMetadataViewModel;
       const rows = m && m.metadata && m.metadata.contentMetadataViewModel && m.metadata.contentMetadataViewModel.metadataRows;
       const part = rows && rows[0] && rows[0].metadataParts && rows[0].metadataParts[0];
@@ -846,7 +850,7 @@ const LIST_VIDEOS = `(() => {
     loggedIn = !!(window.ytcfg && window.ytcfg.get("LOGGED_IN"));
   } catch {}
   return { items: items.slice(0, 15), loggedIn };
-})()`;
+})(${live})`;
 
 const TOGGLE_PLAY = `(() => {
   const v = document.querySelector("video");
@@ -883,8 +887,8 @@ async function evaluateInTab(url, expression) {
   }
 }
 
-async function listVideos(url) {
-  return (await evaluateInTab(url, LIST_VIDEOS)) ?? { items: [], loggedIn: false };
+async function listVideos(url, live) {
+  return (await evaluateInTab(url, LIST_VIDEOS(live))) ?? { items: [], loggedIn: false };
 }
 
 // ---------- input ----------
@@ -1020,7 +1024,7 @@ async function handle(req, res) {
       return reply(res, 200, { ok: true, casting });
     case "POST /list":
       if (typeof body.url !== "string") throw new Error("url is required");
-      return reply(res, 200, { ok: true, ...(await listVideos(body.url)) });
+      return reply(res, 200, { ok: true, ...(await listVideos(body.url, body.live === true)) });
     case "POST /twitch/list":
       if (body.query !== undefined && typeof body.query !== "string") throw new Error("query must be a string");
       return reply(res, 200, { ok: true, ...(await listTwitch(body.query?.trim())) });
@@ -1051,6 +1055,16 @@ async function handle(req, res) {
         casting,
         streaming,
       });
+    case "GET /accounts": {
+      // The sign-in cookies of the browser, read without a page.
+      const { cookies } = await cdp.send("Storage.getCookies");
+      const has = (names, domain) => cookies.some((c) => names.includes(c.name) && domain.test(c.domain));
+      return reply(res, 200, {
+        ok: true,
+        youtube: has(["SAPISID", "__Secure-3PSID"], /(^|\.)(google|youtube)\.com$/),
+        twitch: has(["auth-token"], /(^|\.)twitch\.tv$/),
+      });
+    }
     case "POST /quit":
       reply(res, 200, { ok: true });
       res.on("finish", () => shutdown(0));

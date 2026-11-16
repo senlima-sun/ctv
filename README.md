@@ -4,11 +4,14 @@ A Claude Code mod that plays a small live video in a floating panel at the botto
 
 | Command | What it does |
 | --- | --- |
-| `/ctv` | List your YouTube home feed; when a video is loaded, hide or show the panel |
-| `/ctv home` | List your YouTube home feed |
-| `/ctv <text>` | Search YouTube |
-| `/ctv twitch` | List the Twitch channels you follow that are live |
-| `/ctv twitch <text>` | Search Twitch |
+| `/ctv` | When a video is loaded, hide or show the panel; else list the start of a site (YouTube home, Twitch follow) |
+| `/ctv yt`, `/ctv youtube` | List your YouTube home feed |
+| `/ctv th`, `/ctv twitch` | List the Twitch channels you follow that are live |
+| `/ctv [yt \| th] search <text>` | Search; all the text after `search` is the query |
+| `/ctv [yt \| th] <text>` | Search, the same as `search <text>` |
+| `/ctv [yt \| th] follow` | YouTube: your subscriptions feed; Twitch: the channels you follow that are live |
+| `/ctv yt streaming`, `/ctv th streaming` | The channels you follow on that site that are live now |
+| `/ctv streaming` | Who is live now on every site you are signed in to, in one list |
 | `/ctv <number>` | Play that item from the last list |
 | `/ctv <url>` | Play a YouTube or Twitch link |
 | `/ctv pause` | Play or pause |
@@ -16,8 +19,9 @@ A Claude Code mod that plays a small live video in a floating panel at the botto
 | `/ctv bigger`, `/ctv smaller` | Resize the panel |
 | `/ctv gray` | Black and white on or off |
 | `/ctv off` | Stop and close the panel |
-| `/ctv login` | Open Chrome to sign in to Google |
-| `/ctv login twitch` | Open Chrome to sign in to Twitch |
+| `/ctv login [yt \| th]` | Open Chrome to sign in to Google (`yt`) or Twitch (`th`); with no site, ctv asks which |
+
+With no site named, ctv uses the site you are signed in to. When you are signed in to both or to neither, it asks which site. Replies show in the transcript only; they are not sent to Claude.
 
 ## Requirements
 
@@ -50,7 +54,7 @@ claude plugin install ctv@ctv
 
 ## First run
 
-Sign in once: `/ctv login` for YouTube and `/ctv login twitch` for Twitch. Each opens a normal Chrome window; sign in there, close it, and come back. The first video you play builds the panel app with `swiftc`, which takes a moment.
+Sign in once: `/ctv login yt` for YouTube and `/ctv login th` for Twitch. Each opens a normal Chrome window; sign in there, close it, and come back. The first video you play builds the panel app with `swiftc`, which takes a moment.
 
 ## Your data
 

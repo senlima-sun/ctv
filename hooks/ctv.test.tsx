@@ -81,7 +81,7 @@ test('/ctv lists, plays by number, hides, lists home and pauses', async ($, on) 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 
   // A search starts the helper and logs the list as text.
-  await $.command.run({ ...RUN, args: 'cats' })
+  await $.command.run({ ...RUN, args: 'yt cats' })
   await firstList
   await listShown
   expect(spawns).toHaveLength(1)
@@ -104,19 +104,20 @@ test('/ctv lists, plays by number, hides, lists home and pauses', async ($, on) 
   expect(body(last('/navigate'))).toEqual({ url: 'https://www.youtube.com/watch?v=abc' })
   expect(body(last('/cast'))).toEqual({ on: true })
 
-  // No argument with a video loaded: hide.
-  expect(await $.command.run({ ...RUN, args: '' })).toEqual({
-    text: 'YouTube window hidden. Sound keeps playing.',
-  })
+  // No argument with a video loaded: hide. The reply is a log row, which the
+  // model does not read; the hook's answer has no text.
+  expect(await $.command.run({ ...RUN, args: '' })).toEqual({})
+  expect(logs).toContain('YouTube window hidden. Sound keeps playing.')
   expect(body(last('/cast'))).toEqual({ on: false })
 
-  // `home` lists the home feed, also while a video is loaded.
-  await $.command.run({ ...RUN, args: 'home' })
+  // `yt` lists the home feed, also while a video is loaded.
+  await $.command.run({ ...RUN, args: 'yt' })
   await secondList
   expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/' })
 
   // `gray` turns black and white on in the running helper.
-  await $.command.run({ ...RUN, args: 'gray' })
+  expect(await $.command.run({ ...RUN, args: 'gray' })).toEqual({})
+  expect(logs).toContain('YouTube: black and white on.')
   expect(body(last('/gray'))).toEqual({ on: true })
 
   // `mute` turns sound off, and a second `mute` keeps it off; `unmute` turns it on.
@@ -215,17 +216,194 @@ test('/ctv twitch lists who you follow, plays by number, searches and asks to si
   await cast
   expect(body(last('/navigate'))).toEqual({ url: 'https://www.twitch.tv/cat' })
   // Messages name the site that plays.
-  expect(await $.command.run({ ...RUN, args: 'pause' })).toEqual({ text: 'Twitch: play/pause.' })
+  expect(await $.command.run({ ...RUN, args: 'pause' })).toEqual({})
+  expect(logs).toContain('Twitch: play/pause.')
 
   // Signed out, the followed list asks for a Twitch sign-in.
   await $.command.run({ ...RUN, args: 'twitch' })
   await nobodyLive
-  expect(toasts).toContain('Twitch is signed out. Run /ctv login twitch to sign in once.')
+  expect(toasts).toContain('Twitch is signed out. Run /ctv login th to sign in once.')
 
   // A search sends the text and needs no sign-in.
   const toastsBefore = toasts.length
-  await $.command.run({ ...RUN, args: 'twitch some text' })
+  await $.command.run({ ...RUN, args: 'th some text' })
   await searchShown
   expect(body(last('/twitch/list'))).toEqual({ query: 'some text' })
   expect(toasts).toHaveLength(toastsBefore)
+})
+
+test('/ctv aliases, follow, search and the site question', async ($, on) => {
+  const fetches: Fetch[] = []
+  const logs: string[] = []
+  const toasts: string[] = []
+  const runs: (readonly string[])[] = []
+  const questions: string[] = []
+  // The sign-in state /accounts reports, and the answers the person gives in turn.
+  let accounts = { youtube: true, twitch: false }
+  const answers: string[] = []
+  // Each wait settles once its check holds, checked after every fetch, log and run.
+  const checks: { holds: () => boolean; resolve: () => void }[] = []
+  const settle = () => {
+    for (const check of [...checks]) {
+      if (check.holds()) {
+        checks.splice(checks.indexOf(check), 1)
+        check.resolve()
+      }
+    }
+  }
+  const until = (holds: () => boolean) =>
+    new Promise<void>(resolve => {
+      checks.push({ holds, resolve })
+      settle()
+    })
+
+  on('command.register', () => ({ value: { command: 'ctv' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+  on('ui.log', (_, e) => {
+    logs.push(e.text)
+    settle()
+
+    return { value: undefined }
+  })
+  on('tool.call', { tool: 'AskUserQuestion' }, (_, e) => {
+    const question = e.questions[0]?.question ?? ''
+    questions.push(question)
+
+    return { result: { questions: e.questions, answers: { [question]: answers.shift() ?? '' } } }
+  })
+  on('http.fetch', (_, e) => {
+    fetches.push(e as Fetch)
+    const path = e.url.replace('http://ctv', '')
+    const sent = e.init?.body === undefined ? {} : (JSON.parse(String(e.init.body)) as { live?: boolean; query?: string })
+    // A live list holds one item on each site; every other list holds none.
+    const text = path === '/accounts'
+      ? JSON.stringify({ ok: true, ...accounts })
+      : path === '/list'
+        ? sent.live === true
+          ? '{"ok":true,"loggedIn":true,"items":[{"id":"yl","title":"YT live","channel":"Y","length":"","url":"https://www.youtube.com/watch?v=yl"}]}'
+          : '{"ok":true,"loggedIn":false,"items":[]}'
+        : path === '/twitch/list' && sent.query === undefined
+          ? '{"ok":true,"loggedIn":true,"items":[{"id":"tl","title":"TH live","channel":"T","length":"5 watching","url":"https://www.twitch.tv/tl"}]}'
+          : '{"ok":true,"items":[]}'
+    settle()
+
+    return { value: { status: 200, ok: true, headers: {}, text } }
+  })
+  on('process.spawn', async function* () {
+    yield { stream: 'stdout' as const, text: '{"t":"ready"}\n' }
+    await new Promise<void>(() => {})
+
+    return { value: { code: 0, signal: null } }
+  })
+  on('process.run', (_, e) => {
+    runs.push(e.argv)
+    settle()
+
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  const body = (one: Fetch | undefined) => JSON.parse(String(one?.init?.body)) as unknown
+  const posts = (path: string) => fetches.filter(one => one.url === `http://ctv${path}`)
+  const last = (path: string) => posts(path).at(-1)
+  const after = (path: string, count: number) => until(() => posts(path).length >= count)
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  // `yt` alone lists the YouTube home feed; the hook's answer has no text.
+  expect(await $.command.run({ ...RUN, args: 'yt' })).toEqual({})
+  await after('/list', 1)
+  expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/' })
+  expect(logs).toContain('YouTube: loading your home feed…')
+
+  // `th <text>` searches Twitch; `th follow` and `twitch` list who you follow.
+  await $.command.run({ ...RUN, args: 'th foo' })
+  await after('/twitch/list', 1)
+  expect(body(last('/twitch/list'))).toEqual({ query: 'foo' })
+  await $.command.run({ ...RUN, args: 'th follow' })
+  await after('/twitch/list', 2)
+  expect(body(last('/twitch/list'))).toEqual({})
+  await $.command.run({ ...RUN, args: 'twitch' })
+  await after('/twitch/list', 3)
+  expect(body(last('/twitch/list'))).toEqual({})
+
+  // `yt follow` lists the subscriptions feed, and signed out asks for a sign-in.
+  await $.command.run({ ...RUN, args: 'yt follow' })
+  await after('/list', 2)
+  expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/feed/subscriptions' })
+  await until(() => toasts.includes('YouTube is signed out. Run /ctv login yt to sign in once.'))
+
+  // Only YouTube signed in: a search with no site goes there unasked, the text kept whole.
+  await $.command.run({ ...RUN, args: 'search first and second' })
+  await after('/list', 3)
+  expect(body(last('/list'))).toEqual({
+    url: 'https://www.youtube.com/results?search_query=first%20and%20second',
+  })
+  await $.command.run({ ...RUN, args: 'foo' })
+  await after('/list', 4)
+  expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/results?search_query=foo' })
+  expect(questions).toEqual([])
+
+  // `search` with no text asks for one.
+  expect(await $.command.run({ ...RUN, args: 'search' })).toEqual({})
+  expect(logs).toContain('ctv: search what?')
+
+  // Both signed in: the person picks the site.
+  accounts = { youtube: true, twitch: true }
+  answers.push('Twitch')
+  expect(await $.command.run({ ...RUN, args: 'foo' })).toEqual({})
+  await after('/twitch/list', 4)
+  expect(questions).toEqual(['Which site?'])
+  expect(body(last('/twitch/list'))).toEqual({ query: 'foo' })
+
+  // Text typed under "Other" that is no site lists nothing.
+  answers.push('Vimeo')
+  await $.command.run({ ...RUN, args: 'bar' })
+  await until(() => logs.includes('ctv: pick YouTube or Twitch.'))
+  expect(posts('/twitch/list')).toHaveLength(4)
+  expect(posts('/list')).toHaveLength(4)
+
+  // `yt streaming` lists only the YouTube subscriptions that are live.
+  await $.command.run({ ...RUN, args: 'yt streaming' })
+  await after('/list', 5)
+  expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/feed/subscriptions', live: true })
+
+  // `streaming` with no site asks nothing and lists both sites, numbered across both.
+  await $.command.run({ ...RUN, args: 'streaming' })
+  await until(() => logs.some(line => line.includes('[TH] TH live')))
+  expect(questions).toHaveLength(2)
+  expect(body(last('/list'))).toEqual({ url: 'https://www.youtube.com/feed/subscriptions', live: true })
+  expect(posts('/list')).toHaveLength(6)
+  expect(body(last('/twitch/list'))).toEqual({})
+  const heading = logs.lastIndexOf('Live now · /ctv <number> plays one')
+  expect(heading).toBeGreaterThan(-1)
+  expect(logs[heading + 1]).toBe(' 1. [YT] YT live — Y  https://www.youtube.com/watch?v=yl')
+  expect(logs[heading + 2]).toBe(' 2. [TH] TH live — T (5 watching)  https://www.twitch.tv/tl')
+  await $.command.run({ ...RUN, args: '2' })
+  await after('/navigate', 1)
+  expect(body(last('/navigate'))).toEqual({ url: 'https://www.twitch.tv/tl' })
+  expect(logs).toContain('Twitch: playing TH live')
+
+  // Neither site signed in: a toast says to sign in.
+  accounts = { youtube: false, twitch: false }
+  await $.command.run({ ...RUN, args: 'streaming' })
+  await until(() => toasts.includes('ctv: sign in first: /ctv login yt or /ctv login th'))
+  expect(posts('/list')).toHaveLength(6)
+
+  // `login` with no site asks which; YouTube opens the Google sign-in.
+  answers.push('YouTube')
+  expect(await $.command.run({ ...RUN, args: 'login' })).toEqual({})
+  await until(() => runs.length === 1)
+  expect(questions.at(-1)).toBe('Sign in to which site?')
+  expect(runs[0]?.at(-1)).toBe('--login')
+
+  // `login th` opens the Twitch sign-in without asking.
+  await $.command.run({ ...RUN, args: 'login th' })
+  expect(runs[1]?.at(-1)).toBe('--login-twitch')
+  expect(questions).toHaveLength(3)
 })
