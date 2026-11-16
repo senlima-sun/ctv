@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // view: run a headless Chrome that shows YouTube and send the page picture
-// as JPEG frames to the floating panel over a pipe (its fd 3). Zero npm
-// dependencies (Node 22).
+// as JPEG frames to the floating panel over a pipe (its fd 3). A YouTube live
+// video plays in the panel itself instead (its AVPlayer, from the video's HLS
+// URL): the page then goes to about:blank and no frames are sent, which costs
+// much less CPU. Zero npm dependencies (Node 22).
 //
 // stdout: one JSON object per line (ready / nav / error).
 // stderr: diagnostics.
@@ -22,6 +24,11 @@ const CDP_TIMEOUT_MS = 10000;
 // A playing video that sends no frame for this long means Chrome stopped the
 // screencast (it waits for acks): the watchdog starts it again.
 const FRAME_STALL_MS = 3000;
+// How long POST /navigate waits for a YouTube video's player data to tell
+// whether it is live.
+const LIVE_CHECK_MS = 10000;
+// How long POST /toggle waits for the panel's answer while a stream plays.
+const PANEL_ANSWER_MS = 3000;
 // The floating panel that shows the frames: a small Swift program, built once
 // from the source beside this file. The binary lives outside the mod folder so
 // writing it does not reload the mod.
@@ -202,6 +209,13 @@ let pointerDown = false;
 let lastUrl = "";
 let lastTitle = "";
 let shuttingDown = false;
+// A live video plays in the panel (stream mode): the page is about:blank.
+let streaming = false;
+// The video page of the stream, to go back to when the stream fails.
+let streamUrl = "";
+let streamLoggedIn = false;
+// Waits for the panel's answer to play / pause / toggle, oldest first.
+let panelAnswers = [];
 
 // ---------- Chrome ----------
 
@@ -293,6 +307,8 @@ async function attachPage() {
 
   cdp.on("Target.targetInfoChanged", ({ targetInfo }) => {
     if (targetInfo.targetId !== targetId) return;
+    // In stream mode the page is about:blank; the video stays the page.
+    if (streaming) return;
     if (targetInfo.url === lastUrl && targetInfo.title === lastTitle) return;
     lastUrl = targetInfo.url;
     lastTitle = targetInfo.title;
@@ -381,22 +397,67 @@ async function ensurePanel() {
     fs.mkdirSync(path.dirname(PANEL_BIN), { recursive: true });
     await promisify(execFile)("/usr/bin/swiftc", ["-O", PANEL_SRC, "-o", PANEL_BIN], { timeout: 180000 });
   }
-  const child = spawn(PANEL_BIN, ["--width", String(width), "--height", String(height)], { stdio: ["pipe", "ignore", "pipe", "pipe"] });
+  const child = spawn(PANEL_BIN, ["--width", String(width), "--height", String(height)], { stdio: ["pipe", "pipe", "pipe", "pipe"] });
   child.stderr.on("data", (d) => process.stderr.write(d));
+  let rest = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (text) => {
+    const lines = (rest + text).split("\n");
+    rest = lines.pop();
+    for (const line of lines) if (line.trim()) onPanelLine(line);
+  });
   child.stdin.on("error", () => {});
   child.stdio[3].on("error", () => {});
   child.on("exit", () => {
     if (panel !== child) return;
     panel = null;
     panelBusy = false;
+    for (const answer of panelAnswers) answer(null);
+    panelAnswers = [];
   });
   panel = child;
+}
+
+// The panel's stdout: stream state lines. The line after play / pause /
+// toggle answers it; a failed stream goes back to the page.
+function onPanelLine(line) {
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    log("panel said:", line);
+    return;
+  }
+  if (msg.t !== "stream") return;
+  if (msg.state === "failed") {
+    streamFailed(msg.message ?? "unknown error").catch((err) => log("cannot go back to the page:", err.message));
+    return;
+  }
+  panelAnswers.shift()?.(msg.state);
+}
+
+// Sends play / pause / toggle to the panel and waits for the state after it
+// (playing, paused or none); null when the panel does not answer.
+function askPanel(command) {
+  return new Promise((resolve) => {
+    const answer = (state) => {
+      clearTimeout(timer);
+      resolve(state);
+    };
+    const timer = setTimeout(() => {
+      panelAnswers = panelAnswers.filter((one) => one !== answer);
+      resolve(null);
+    }, PANEL_ANSWER_MS);
+    panelAnswers.push(answer);
+    toPanel(command);
+  });
 }
 
 // Black and white: Chrome draws the whole page without color (its emulation of
 // achromatopsia), so every frame and every later page is gray too.
 async function setGray(on) {
   await cdp.send("Emulation.setEmulatedVisionDeficiency", { type: on ? "achromatopsia" : "none" }, session);
+  if (streaming) toPanel(`gray ${on ? "on" : "off"}`);
   gray = on;
 }
 
@@ -415,6 +476,7 @@ async function setMuted(on) {
     window.__ctvMuted = ${on};
     for (const v of document.querySelectorAll("video, audio")) v.muted = ${on};
   })()`);
+  if (streaming) toPanel(`mute ${on ? "on" : "off"}`);
   muted = on;
 }
 
@@ -426,13 +488,16 @@ async function setCasting(on) {
     toPanel("hide");
   }
   if (on === casting) return;
-  if (on) {
-    await startScreencast();
-  } else {
-    await cdp.send("Page.stopScreencast", {}, session);
+  // In stream mode the panel plays the stream: no screencast.
+  if (!streaming) {
+    if (on) {
+      await startScreencast();
+    } else {
+      await cdp.send("Page.stopScreencast", {}, session);
+    }
   }
   casting = on;
-  if (on) startWatchdog();
+  if (on && !streaming) startWatchdog();
   else stopWatchdog();
 }
 
@@ -472,7 +537,7 @@ function stopWatchdog() {
 }
 
 async function checkFrames() {
-  if (!casting || watchdogBusy || shuttingDown) return;
+  if (!casting || streaming || watchdogBusy || shuttingDown) return;
   const gap = performance.now() - lastRawFrameAt;
   if (gap < FRAME_STALL_MS) return;
   watchdogBusy = true;
@@ -535,6 +600,104 @@ function waitForLoad(timeoutMs) {
       resolve();
     });
   });
+}
+
+// ---------- live streams ----------
+
+// The video id of a YouTube watch or live URL, else null.
+function youtubeVideoId(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return null;
+  }
+  if (!/(^|\.)youtube\.com$/.test(u.hostname)) return null;
+  if (u.pathname === "/watch") return u.searchParams.get("v");
+  return u.pathname.match(/^\/live\/([\w-]+)/)?.[1] ?? null;
+}
+
+// The player's data for video `id` (null while the player has another video
+// or none): live, its HLS URL and its title. The player's getPlayerResponse is
+// current after a YouTube navigation too; ytInitialPlayerResponse is not.
+const LIVE_STREAM = (id) => `(() => {
+  const r = document.getElementById("movie_player")?.getPlayerResponse?.();
+  const d = r?.videoDetails;
+  if (!d || d.videoId !== ${JSON.stringify(id)}) return null;
+  const hls = r.streamingData?.hlsManifestUrl || "";
+  const ended = !!r.microformat?.playerMicroformatRenderer?.liveBroadcastDetails?.endTimestamp;
+  const live = !!hls && (d.isLive === true || (d.isLiveContent === true && !ended));
+  return { live, hls, title: d.title || "" };
+})()`;
+
+// Waits for the player data of the video in `url`. Returns it when the video
+// is live, else null.
+async function findLiveStream(url) {
+  const id = youtubeVideoId(url);
+  if (!id) return null;
+  const deadline = performance.now() + LIVE_CHECK_MS;
+  while (performance.now() < deadline) {
+    let found = null;
+    try {
+      found = await evaluate(LIVE_STREAM(id));
+    } catch {}
+    if (found) return found.live ? found : null;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  log("no player data for", id, "; showing the page");
+  return null;
+}
+
+// Stream mode: the panel plays the HLS URL, the page goes to about:blank so
+// it does not decode the video or play its sound too. The video stays the
+// page (lastUrl, lastTitle).
+async function startStream(live) {
+  await ensurePanel();
+  if (!panel) return false;
+  const page = await evaluate(`({ url: location.href, title: document.title })`);
+  streamUrl = page?.url || lastUrl;
+  streamLoggedIn = await isLoggedIn();
+  const title = page?.title && page.title !== "YouTube" ? page.title : live.title;
+  toPanel(`mute ${muted ? "on" : "off"}`);
+  toPanel(`gray ${gray ? "on" : "off"}`);
+  toPanel(`stream ${live.hls}`);
+  streaming = true;
+  stopWatchdog();
+  if (casting) await cdp.send("Page.stopScreencast", {}, session);
+  if (streamUrl !== lastUrl || title !== lastTitle) {
+    lastUrl = streamUrl;
+    lastTitle = title;
+    emit({ t: "nav", url: lastUrl, title: lastTitle });
+  }
+  await navigate("about:blank");
+  return true;
+}
+
+// Leaves stream mode; the page shows again when the view is cast.
+async function stopStream() {
+  if (!streaming) return;
+  toPanel("stream-stop");
+  streaming = false;
+  if (casting) {
+    await startScreencast();
+    startWatchdog();
+  }
+}
+
+async function streamFailed(message) {
+  if (!streaming) return;
+  emit({ t: "error", message: `Live stream failed, playing in the page instead: ${message}` });
+  await stopStream();
+  await navigate(streamUrl);
+}
+
+// Leaves stream mode, loads `url`, and plays it in the panel when it is a live
+// video. Returns whether it streams.
+async function openUrl(url) {
+  await stopStream();
+  await navigate(url);
+  const live = args["no-panel"] ? null : await findLiveStream(url);
+  return live ? startStream(live) : false;
 }
 
 // ---------- video list ----------
@@ -730,9 +893,10 @@ async function handle(req, res) {
   switch (route) {
     case "POST /navigate":
       if (typeof body.url !== "string") throw new Error("url is required");
-      await navigate(body.url);
-      return reply(res, 200, { ok: true });
+      return reply(res, 200, { ok: true, streaming: await openUrl(body.url) });
     case "POST /input":
+      // The panel plays the stream: there is no page to send input to.
+      if (streaming) return reply(res, 200, { ok: true });
       for (const ev of body.events ?? []) await sendInput(ev);
       return reply(res, 200, { ok: true });
     case "POST /cast":
@@ -753,9 +917,21 @@ async function handle(req, res) {
       toPanel(`resize ${body.factor}`);
       return reply(res, 200, { ok: true });
     case "POST /toggle":
+      if (streaming) {
+        const state = await askPanel("toggle");
+        if (state === null) throw new Error("the panel did not answer");
+        return reply(res, 200, { ok: true, paused: state === "none" ? null : state === "paused" });
+      }
       return reply(res, 200, { ok: true, paused: await evaluate(TOGGLE_PLAY) });
     case "GET /state":
-      return reply(res, 200, { ok: true, url: lastUrl, title: lastTitle, loggedIn: await isLoggedIn(), casting });
+      return reply(res, 200, {
+        ok: true,
+        url: lastUrl,
+        title: lastTitle,
+        loggedIn: streaming ? streamLoggedIn : await isLoggedIn(),
+        casting,
+        streaming,
+      });
     case "POST /quit":
       reply(res, 200, { ok: true });
       res.on("finish", () => shutdown(0));
