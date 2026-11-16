@@ -75,6 +75,7 @@ rm -rf ~/Library/Application\ Support/ctv
 ```
 npm run check
 claude plugin test .
+xcrun swift-format format -i helper/panel.swift
 ```
 
 `npm run check` runs oxfmt and oxlint through `npx` at pinned versions, so the repo has no dependencies at all and an install pulls nothing extra. `npm run fmt` formats the files.
