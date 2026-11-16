@@ -1,0 +1,5 @@
+{
+  "name": "ctv",
+  "owner": { "name": "Senlima Sun" },
+  "plugins": [{ "name": "ctv", "source": "./" }]
+}
