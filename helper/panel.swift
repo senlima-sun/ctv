@@ -1,25 +1,51 @@
-// ctv-panel: shows JPEG frames in a small floating panel at the bottom-right
-// of the screen. It never activates and never takes keyboard focus. The
+// ctv-panel: shows JPEG frames, or plays an HLS stream, in a small floating
+// panel at the bottom-right of the screen. It never activates and never takes keyboard focus. The
 // person moves it by dragging and sizes it by dragging an edge; it keeps its
 // aspect ratio, and its place and size are remembered between runs.
 //
 // Usage: ctv-panel [--width 440] [--height 272] [--margin 16]   (points)
 // fd 3, the frame stream: each frame is a 4-byte big-endian length, then that
 // many bytes of image data (JPEG). Only the newest frame waits for the screen.
-// End of fd 3 stops only the frame reader.
+// End of fd 3 stops only the frame reader. While a stream plays, frames from
+// fd 3 are read and dropped.
 // stdin, one command per line:
 //   show | hide               order the panel front (no activation) / out
 //   resize <factor>           scale the panel (1.25 bigger, 0.8 smaller)
 //   snapshot <absolute path>  write a PNG of what the panel shows now
 //   drag <ex> <ey> <dx> <dy>  for tests: resize as a drag of those edges would
 //                             (ex -1 left, 1 right; ey -1 bottom, 1 top)
-// End of stdin or SIGTERM exits 0. stdout stays empty; problems go to stderr.
+//   stream <url>              play this HLS URL in place of the frames; a new
+//                             stream replaces the old one
+//   stream-stop               stop the stream and show the frames again
+//   play | pause | toggle     act on the stream (none: no change)
+//   mute on|off               mute the stream; kept for later streams
+//   gray on|off               show the stream in black and white; kept too
+// stdout, one JSON object per line:
+//   {"t":"stream","state":"playing"|"paused"}       the player started or paused
+//   {"t":"stream","state":"failed","message":"..."} the stream cannot play
+//   after play, pause or toggle, always one line with the state after it:
+//   {"t":"stream","state":"playing"|"paused"|"none"} (none: no stream)
+// End of stdin or SIGTERM exits 0. Problems go to stderr.
 
+import AVFoundation
 import AppKit
+import CoreImage
 import ImageIO
 
 func warn(_ message: String) {
   FileHandle.standardError.write(Data("ctv-panel: \(message)\n".utf8))
+}
+
+// One stream state line on stdout. The write is unbuffered, so the line goes
+// out at once.
+func report(_ state: String, message: String? = nil) {
+  var line = "{\"t\":\"stream\",\"state\":\"\(state)\""
+  if let message,
+    let quoted = try? JSONSerialization.data(withJSONObject: message, options: [.fragmentsAllowed])
+  {
+    line += ",\"message\":" + String(decoding: quoted, as: UTF8.self)
+  }
+  FileHandle.standardOutput.write(Data((line + "}\n").utf8))
 }
 
 struct Options {
@@ -60,6 +86,13 @@ enum Command {
   case resize(CGFloat)
   case drag(Int, Int, CGFloat, CGFloat)
   case snapshot(String)
+  case stream(String)
+  case streamStop
+  case play
+  case pause
+  case toggle
+  case mute(Bool)
+  case gray(Bool)
   case end
 }
 
@@ -91,6 +124,13 @@ func parseCommand(_ raw: String) -> Command? {
       return nil
     }
     return .drag(Int(parts[0]), Int(parts[1]), CGFloat(parts[2]), CGFloat(parts[3]))
+  case "stream" where !argument.isEmpty: return .stream(argument)
+  case "stream-stop": return .streamStop
+  case "play": return .play
+  case "pause": return .pause
+  case "toggle": return .toggle
+  case "mute" where argument == "on" || argument == "off": return .mute(argument == "on")
+  case "gray" where argument == "on" || argument == "off": return .gray(argument == "on")
   case "show": return .show
   case "hide": return .hide
   default:
@@ -194,6 +234,28 @@ final class PassThroughImageView: NSImageView {
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+// Shows the stream. Its layer is the player layer; mouse events go to the
+// frame view, as for the image view.
+final class PlayerView: NSView {
+  let playerLayer = AVPlayerLayer()
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    layerUsesCoreImageFilters = true
+    playerLayer.videoGravity = .resizeAspect
+    playerLayer.backgroundColor = NSColor.black.cgColor
+    playerLayer.cornerRadius = 10
+    playerLayer.masksToBounds = true
+  }
+
+  required init?(coder: NSCoder) { nil }
+
+  override func makeBackingLayer() -> CALayer { playerLayer }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 // How near an edge, in points, a press must be to size the panel, not move it.
 let gripSize: CGFloat = 16
 
@@ -242,6 +304,7 @@ func widthLimits(of window: NSWindow) -> (min: CGFloat, max: CGFloat) {
 
 final class FrameView: NSView {
   let imageView = PassThroughImageView()
+  let playerView = PlayerView()
   var onResized: (() -> Void)?
 
   override init(frame frameRect: NSRect) {
@@ -255,6 +318,10 @@ final class FrameView: NSView {
     imageView.imageAlignment = .alignCenter
     imageView.isEditable = false
     addSubview(imageView)
+    playerView.frame = bounds
+    playerView.autoresizingMask = [.width, .height]
+    playerView.isHidden = true
+    addSubview(playerView)
   }
 
   required init?(coder: NSCoder) { nil }
@@ -332,6 +399,18 @@ final class Corner {
   // The size the panel starts at; it may shrink to half of it and grow to four times.
   let base: NSSize
   static let savedFrame = "ctv-panel"
+  // The stream that plays now, if any, and what watches it.
+  private var player: AVPlayer?
+  private var watchers: [NSKeyValueObservation] = []
+  private var notes: [NSObjectProtocol] = []
+  // The last state line sent for this stream, so a state is not sent twice.
+  private var lastState: String?
+  // Whether play or pause was asked for last; playback that stops while play
+  // was asked for has ended by itself.
+  private var wantsPlay = false
+  // Kept across streams.
+  private var muted = false
+  private var gray = false
 
   init(options: Options) {
     let size = NSSize(width: options.width, height: options.height)
@@ -397,13 +476,144 @@ final class Corner {
               minWidth: widthLimits(of: panel).min, maxWidth: widthLimits(of: panel).max),
             display: true)
         case .snapshot(let path): snapshot(path)
+        case .stream(let url): startStream(url)
+        case .streamStop: stopStream()
+        case .play: control(play: true)
+        case .pause: control(play: false)
+        case .toggle: control(play: player.map { $0.rate == 0 } ?? false)
+        case .mute(let on):
+          muted = on
+          player?.isMuted = on
+        case .gray(let on):
+          gray = on
+          applyGray()
         case .end: exit(0)
         }
       }
     }
   }
 
+  // Sends a state line for the stream, unless it is the last one sent. After
+  // failed, the stream sends nothing more.
+  private func send(_ state: String, message: String? = nil) {
+    guard lastState != state, lastState != "failed" else { return }
+    lastState = state
+    report(state, message: message)
+  }
+
+  private func startStream(_ text: String) {
+    stopStream()
+    guard let url = URL(string: text), url.scheme != nil else {
+      warn("stream: bad URL: \(text.prefix(80))")
+      report("failed", message: "bad URL")
+      return
+    }
+    let item = AVPlayerItem(url: url)
+    let player = AVPlayer(playerItem: item)
+    player.isMuted = muted
+    self.player = player
+    lastState = nil
+    wantsPlay = true
+    // Observers run on the main thread; each checks that its stream still plays.
+    func onMain(_ body: @escaping @MainActor (Corner) -> Void) -> @Sendable () -> Void {
+      { [weak self] in
+        DispatchQueue.main.async {
+          MainActor.assumeIsolated {
+            guard let self, self.player === player else { return }
+            body(self)
+          }
+        }
+      }
+    }
+    let statusChanged = onMain { corner in
+      switch player.timeControlStatus {
+      case .playing: corner.send("playing")
+      case .paused: corner.send("paused")
+      default: break
+      }
+    }
+    let itemChanged = onMain { corner in
+      guard item.status == .failed else { return }
+      let message = item.error?.localizedDescription ?? "the stream failed"
+      warn("stream: \(message)")
+      corner.send("failed", message: message)
+    }
+    watchers = [
+      player.observe(\.timeControlStatus, options: [.initial, .new]) { _, _ in statusChanged() },
+      item.observe(\.status, options: [.initial, .new]) { _, _ in itemChanged() },
+    ]
+    let center = NotificationCenter.default
+    notes = [
+      center.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification, object: item, queue: .main) {
+        note in
+        let error = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+        let message = error?.localizedDescription ?? "the stream stopped"
+        MainActor.assumeIsolated {
+          guard self.player === player else { return }
+          warn("stream: \(message)")
+          self.send("failed", message: message)
+        }
+      },
+      // An error log entry is often passing; it ends the stream only when the
+      // player stopped although play was asked for.
+      center.addObserver(forName: AVPlayerItem.newErrorLogEntryNotification, object: item, queue: .main) { _ in
+        MainActor.assumeIsolated {
+          guard self.player === player, let event = item.errorLog()?.events.last else { return }
+          let message = event.errorComment ?? "error \(event.errorStatusCode)"
+          warn("stream: \(event.errorDomain) \(event.errorStatusCode): \(message)")
+          if self.wantsPlay && player.timeControlStatus == .paused {
+            self.send("failed", message: message)
+          }
+        }
+      },
+    ]
+    frameView.playerView.playerLayer.player = player
+    applyGray()
+    frameView.playerView.isHidden = false
+    frameView.imageView.isHidden = true
+    player.play()
+  }
+
+  private func stopStream() {
+    guard let player else { return }
+    watchers.forEach { $0.invalidate() }
+    watchers = []
+    notes.forEach(NotificationCenter.default.removeObserver)
+    notes = []
+    player.pause()
+    player.replaceCurrentItem(with: nil)
+    self.player = nil
+    frameView.playerView.playerLayer.player = nil
+    frameView.playerView.isHidden = true
+    frameView.imageView.isHidden = false
+  }
+
+  // Plays or pauses the stream, then sends the state after it.
+  private func control(play: Bool) {
+    guard let player else {
+      report("none")
+      return
+    }
+    wantsPlay = play
+    let state = play ? "playing" : "paused"
+    // Set first, so the status observer does not send the same state again.
+    if lastState != "failed" { lastState = state }
+    if play { player.play() } else { player.pause() }
+    report(state)
+  }
+
+  private func applyGray() {
+    let layer = frameView.playerView.playerLayer
+    guard gray, let filter = CIFilter(name: "CIColorControls") else {
+      layer.filters = nil
+      return
+    }
+    filter.setValue(0, forKey: kCIInputSaturationKey)
+    layer.filters = [filter]
+  }
+
   func showFrame(_ frame: CGImage) {
+    guard player == nil else { return }
     guard frame.width > 0, frame.height > 0 else { return }
     let scale = max(panel.backingScaleFactor, 1)
     let size = NSSize(width: CGFloat(frame.width) / scale, height: CGFloat(frame.height) / scale)
@@ -411,6 +621,10 @@ final class Corner {
   }
 
   private func snapshot(_ path: String) {
+    // The bitmap cannot hold the video; the stream time shows that it plays.
+    if let player {
+      warn("snapshot: the stream is not in the picture; stream time \(player.currentTime().seconds)")
+    }
     let bounds = frameView.bounds
     guard let rep = frameView.bitmapImageRepForCachingDisplay(in: bounds) else {
       warn("snapshot: no bitmap")
