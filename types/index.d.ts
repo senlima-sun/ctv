@@ -1,5 +1,6 @@
-// One video of a list the helper read off a YouTube page.
-export type Video = { id: string; title: string; channel: string; length: string }
+// One video of a list the helper read off a YouTube or Twitch page. On Twitch
+// `id` is the channel login and `length` says how many are watching.
+export type Video = { id: string; title: string; channel: string; length: string; url: string }
 
 declare module 'claude-code' {
   interface PluginState {

@@ -24,6 +24,8 @@ const muted = atom({ plugin: 'ctv', key: 'muted' } as const, false)
 
 type Child = HookStream<ProcessSpawnChunk, ProcessSpawnResult>
 
+type Site = 'YouTube' | 'Twitch'
+
 type HelperLine =
   | { t: 'ready' }
   | { t: 'nav'; url: string; title: string }
@@ -35,11 +37,13 @@ let child: Child | null = null
 // Settles true when the running child's control socket answers, false when
 // the child ended first.
 let ready: Promise<boolean> | null = null
-// The last list shown, so `/ctv <number>` names one; and whether a video is
-// loaded in the view.
+// The last list shown and its site, so `/ctv <number>` names one; and whether
+// a video is loaded in the view.
 let videos: Video[] = []
+let listSite: Site = 'YouTube'
 let hasVideo = false
 const SIGNED_OUT = 'YouTube is signed out. Run /ctv login to sign in once.'
+const TWITCH_SIGNED_OUT = 'Twitch is signed out. Run /ctv login twitch to sign in once.'
 
 const HOME_URL = 'https://www.youtube.com/'
 
@@ -53,6 +57,8 @@ const CAST_TIMEOUT_MS = 200_000
 
 const searchUrl = (text: string) =>
   `https://www.youtube.com/results?search_query=${encodeURIComponent(text)}`
+
+const siteOf = (url: string): Site => (/^https?:\/\/([^/]+\.)?twitch\.tv\//i.test(url) ? 'Twitch' : 'YouTube')
 
 const randomHex = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(4)), byte =>
@@ -237,35 +243,73 @@ async function hide($: EngineInterface) {
 
 // Both run on after the command's hook returned: a hook has ten seconds, and
 // a cold start plus a page load may take longer.
-async function listVideos($: EngineInterface, url: string, heading: string) {
+type ListRequest = {
+  site: Site
+  path: '/list' | '/twitch/list'
+  body: { url: string } | { query?: string }
+  heading: string
+  // Logged when the list is empty.
+  empty: string
+  // Toasted when the helper reports no sign-in; undefined when none is needed.
+  signedOut: string | undefined
+}
+
+async function listVideos($: EngineInterface, request: ListRequest) {
   if (!(await ensureHelper($))) {
     return
   }
-  const response = await control($, 'POST', '/list', { url }, PAGE_TIMEOUT_MS)
+  const response = await control($, 'POST', request.path, request.body, PAGE_TIMEOUT_MS)
   let found: { items?: Video[]; loggedIn?: boolean } = {}
   try {
     found = JSON.parse(response?.text ?? '{}') as typeof found
   } catch {
     found = {}
   }
-  if (found.loggedIn === false) {
-    $.ui.toast(SIGNED_OUT)
+  if (found.loggedIn === false && request.signedOut !== undefined) {
+    $.ui.toast(request.signedOut)
   }
   videos = found.items ?? []
+  listSite = request.site
   if (videos.length === 0) {
-    $.ui.log(`YouTube: nothing found for ${heading}.`)
+    $.ui.log(request.empty)
 
     return
   }
-  $.ui.log(`YouTube · ${heading} · /ctv <number> plays one`)
+  $.ui.log(`${request.site} · ${request.heading} · /ctv <number> plays one`)
   videos.forEach((video, index) => {
     const by = video.channel === '' ? '' : ` — ${video.channel}`
     const length = video.length === '' ? '' : ` (${video.length})`
-    $.ui.log(
-      `${String(index + 1).padStart(2)}. ${video.title}${by}${length}  https://youtu.be/${video.id}`,
-    )
+    $.ui.log(`${String(index + 1).padStart(2)}. ${video.title}${by}${length}  ${video.url}`)
   })
 }
+
+const youtubeList = (url: string, heading: string): ListRequest => ({
+  site: 'YouTube',
+  path: '/list',
+  body: { url },
+  heading,
+  empty: `YouTube: nothing found for ${heading}.`,
+  signedOut: SIGNED_OUT,
+})
+
+const twitchList = (query: string): ListRequest =>
+  query === ''
+    ? {
+        site: 'Twitch',
+        path: '/twitch/list',
+        body: {},
+        heading: 'following',
+        empty: 'Twitch: nobody you follow is live.',
+        signedOut: TWITCH_SIGNED_OUT,
+      }
+    : {
+        site: 'Twitch',
+        path: '/twitch/list',
+        body: { query },
+        heading: `"${query}"`,
+        empty: `Twitch: nothing found for "${query}".`,
+        signedOut: undefined,
+      }
 
 async function play($: EngineInterface, url: string) {
   if (!(await ensureHelper($))) {
@@ -288,8 +332,9 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'ctv',
-      description: 'List YouTube videos and play one in a small floating window',
-      argumentHint: '[home | search | number | url | pause | mute | unmute | bigger | smaller | gray | off | login]',
+      description: 'List YouTube or Twitch videos and play one in a small floating window',
+      argumentHint:
+        '[home | search | number | url | twitch [search] | pause | mute | unmute | bigger | smaller | gray | off | login [twitch]]',
     })
     // What was stored before a reload describes a child that is gone.
     await reset($)
@@ -320,6 +365,16 @@ export const register: Register = on => {
 
       return {
         text: 'A Chrome window opened. Sign in to Google there, then come back and run /ctv.',
+      }
+    }
+
+    if (args === 'login twitch') {
+      await stopHelper($)
+      await reset($)
+      await $.process.run(['node', `${$.plugin.root}/helper/view.mjs`, '--login-twitch'])
+
+      return {
+        text: 'A Chrome window opened. Sign in to Twitch there, then come back and run /ctv twitch.',
       }
     }
 
@@ -364,27 +419,36 @@ export const register: Register = on => {
     if (/^\d+$/.test(args)) {
       const video = videos[Number(args) - 1]
       if (video === undefined) {
-        return { text: `YouTube: no item ${args} in the last list.` }
+        return { text: `${listSite}: no item ${args} in the last list.` }
       }
-      background($, play($, `https://www.youtube.com/watch?v=${video.id}`))
+      background($, play($, video.url))
 
-      return { text: `YouTube: playing ${video.title}` }
+      return { text: `${listSite}: playing ${video.title}` }
     }
 
     if (/^https?:\/\//i.test(args)) {
       background($, play($, args))
 
-      return { text: `YouTube: opening ${args}` }
+      return { text: `${siteOf(args)}: opening ${args}` }
+    }
+
+    if (args === 'twitch' || args.startsWith('twitch ')) {
+      const query = args.slice('twitch'.length).trim()
+      background($, listVideos($, twitchList(query)))
+
+      return {
+        text: query === '' ? 'Twitch: loading who you follow…' : `Twitch: searching "${query}"…`,
+      }
     }
 
     if (args === 'home') {
-      background($, listVideos($, HOME_URL, 'home'))
+      background($, listVideos($, youtubeList(HOME_URL, 'home')))
 
       return { text: 'YouTube: loading your home feed…' }
     }
 
     if (args !== '') {
-      background($, listVideos($, searchUrl(args), `"${args}"`))
+      background($, listVideos($, youtubeList(searchUrl(args), `"${args}"`)))
 
       return { text: `YouTube: searching "${args}"…` }
     }
@@ -400,7 +464,7 @@ export const register: Register = on => {
 
       return { text: 'YouTube window shown.' }
     }
-    background($, listVideos($, HOME_URL, 'home'))
+    background($, listVideos($, youtubeList(HOME_URL, 'home')))
 
     return { text: 'YouTube: loading your home feed…' }
   })
