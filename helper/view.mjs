@@ -853,9 +853,21 @@ async function findTwitchStream({ login, vod }) {
   return { hls, url, title, loggedIn };
 }
 
+// Which sites the browser is signed in to, from its cookies, without a page.
+async function signedIn() {
+  const { cookies } = await cdp.send("Storage.getCookies");
+  const has = (names, domain) => cookies.some((c) => names.includes(c.name) && domain.test(c.domain));
+  return {
+    youtube: has(["SAPISID", "__Secure-3PSID"], /(^|\.)(google|youtube)\.com$/),
+    twitch: has(["auth-token"], /(^|\.)twitch\.tv$/),
+  };
+}
+
 // Live Twitch channels: the ones the person follows, or the ones that match
 // `query` (Twitch search). At most 15.
 async function listTwitch(query) {
+  // Signed out, there are no follows to ask for (and no hash to recover).
+  if (!query && !(await signedIn()).twitch) return { items: [], loggedIn: false };
   const { loggedIn, data } = query
     ? await twitchGql([{ query: TWITCH_SEARCH, variables: { query } }])
     : await twitchFollowedGql();
@@ -1124,16 +1136,8 @@ async function handle(req, res) {
         casting,
         streaming,
       });
-    case "GET /accounts": {
-      // The sign-in cookies of the browser, read without a page.
-      const { cookies } = await cdp.send("Storage.getCookies");
-      const has = (names, domain) => cookies.some((c) => names.includes(c.name) && domain.test(c.domain));
-      return reply(res, 200, {
-        ok: true,
-        youtube: has(["SAPISID", "__Secure-3PSID"], /(^|\.)(google|youtube)\.com$/),
-        twitch: has(["auth-token"], /(^|\.)twitch\.tv$/),
-      });
-    }
+    case "GET /accounts":
+      return reply(res, 200, { ok: true, ...(await signedIn()) });
     case "POST /quit":
       reply(res, 200, { ok: true });
       res.on("finish", () => shutdown(0));
