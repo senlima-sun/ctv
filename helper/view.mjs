@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // view: run a headless Chrome that shows YouTube and send the page picture
-// out as JPEG frame files. Zero npm dependencies (Node 22).
+// as JPEG frames to the floating panel over a pipe (its fd 3). Zero npm
+// dependencies (Node 22).
 //
-// stdout: one JSON object per line (ready / frame / nav / error).
+// stdout: one JSON object per line (ready / nav / error).
 // stderr: diagnostics.
 // control: HTTP server on <run-dir>/control.sock.
 
@@ -17,7 +18,6 @@ const CHROME_APP = "/Applications/Google Chrome.app";
 const CHROME_BIN = `${CHROME_APP}/Contents/MacOS/Google Chrome`;
 const LOGIN_URL = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
 const MAX_FPS = 24;
-const KEEP_FRAMES = 5;
 const CDP_TIMEOUT_MS = 10000;
 // A playing video that sends no frame for this long means Chrome stopped the
 // screencast (it waits for acks): the watchdog starts it again.
@@ -79,7 +79,6 @@ const profileDir = path.resolve(args.profile);
 const width = Number(args.width);
 const height = Number(args.height);
 const scale = Number(args.scale);
-const framesDir = path.join(runDir, "frames");
 const sockPath = path.join(runDir, "control.sock");
 
 // ---------- output ----------
@@ -193,9 +192,10 @@ let panel = null;
 let gray = false;
 let muted = false;
 let mutedScript = null;
-let frameNo = 0;
 let lastFrameAt = 0;
 let lastRawFrameAt = 0;
+// The panel's frame pipe is full: drop frames until it drains.
+let panelBusy = false;
 let watchdog = null;
 let watchdogBusy = false;
 let pointerDown = false;
@@ -351,19 +351,22 @@ function onFrame({ data, sessionId: frameSession }, sessionId) {
   const now = performance.now();
   if (now - lastFrameAt < 1000 / MAX_FPS) return;
   lastFrameAt = now;
+  frameToPanel(Buffer.from(data, "base64"));
+}
 
-  const n = ++frameNo;
-  const file = path.join(framesDir, `f-${n}.jpg`);
-  const tmp = path.join(framesDir, `.f-${n}.tmp`);
-  try {
-    fs.writeFileSync(tmp, Buffer.from(data, "base64"));
-    fs.renameSync(tmp, file);
-  } catch (err) {
-    emit({ t: "error", message: `cannot write frame: ${err.message}` });
-    return;
-  }
-  toPanel(`frame ${file}`);
-  if (n > KEEP_FRAMES) fs.rmSync(path.join(framesDir, `f-${n - KEEP_FRAMES}.jpg`), { force: true });
+// One frame on the panel's fd 3: a 4-byte big-endian length, then the JPEG.
+// At most one frame waits in Node: while the pipe is full, new frames are
+// dropped, and the panel shows the newest frame that got through.
+function frameToPanel(image) {
+  const stream = panel?.stdio[3];
+  if (!stream || !stream.writable || panelBusy) return;
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(image.length);
+  if (stream.write(Buffer.concat([header, image]))) return;
+  panelBusy = true;
+  stream.once("drain", () => {
+    panelBusy = false;
+  });
 }
 
 function toPanel(line) {
@@ -378,11 +381,14 @@ async function ensurePanel() {
     fs.mkdirSync(path.dirname(PANEL_BIN), { recursive: true });
     await promisify(execFile)("/usr/bin/swiftc", ["-O", PANEL_SRC, "-o", PANEL_BIN], { timeout: 180000 });
   }
-  const child = spawn(PANEL_BIN, ["--width", String(width), "--height", String(height)], { stdio: ["pipe", "ignore", "pipe"] });
+  const child = spawn(PANEL_BIN, ["--width", String(width), "--height", String(height)], { stdio: ["pipe", "ignore", "pipe", "pipe"] });
   child.stderr.on("data", (d) => process.stderr.write(d));
   child.stdin.on("error", () => {});
+  child.stdio[3].on("error", () => {});
   child.on("exit", () => {
-    if (panel === child) panel = null;
+    if (panel !== child) return;
+    panel = null;
+    panelBusy = false;
   });
   panel = child;
 }
@@ -818,9 +824,9 @@ async function shutdown(code) {
   cdp?.close();
   if (panel) {
     panel.stdin.end();
+    panel.stdio[3].end();
     panel.kill("SIGTERM");
   }
-  fs.rmSync(framesDir, { recursive: true, force: true });
   try {
     fs.rmdirSync(runDir);
   } catch {}
@@ -839,7 +845,7 @@ setInterval(() => {
 // ---------- main ----------
 
 async function main() {
-  fs.mkdirSync(framesDir, { recursive: true });
+  fs.mkdirSync(runDir, { recursive: true });
   fs.mkdirSync(profileDir, { recursive: true });
   await releaseProfile();
   await startChrome();

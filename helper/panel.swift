@@ -1,11 +1,13 @@
-// ctv-panel: shows PNG frames in a small floating panel at the bottom-right
+// ctv-panel: shows JPEG frames in a small floating panel at the bottom-right
 // of the screen. It never activates and never takes keyboard focus. The
 // person moves it by dragging and sizes it by dragging an edge; it keeps its
 // aspect ratio, and its place and size are remembered between runs.
 //
 // Usage: ctv-panel [--width 440] [--height 272] [--margin 16]   (points)
+// fd 3, the frame stream: each frame is a 4-byte big-endian length, then that
+// many bytes of image data (JPEG). Only the newest frame waits for the screen.
+// End of fd 3 stops only the frame reader.
 // stdin, one command per line:
-//   frame <absolute path>     show that PNG (newest wins when several wait)
 //   show | hide               order the panel front (no activation) / out
 //   resize <factor>           scale the panel (1.25 bigger, 0.8 smaller)
 //   snapshot <absolute path>  write a PNG of what the panel shows now
@@ -14,6 +16,7 @@
 // End of stdin or SIGTERM exits 0. stdout stays empty; problems go to stderr.
 
 import AppKit
+import ImageIO
 
 func warn(_ message: String) {
   FileHandle.standardError.write(Data("ctv-panel: \(message)\n".utf8))
@@ -52,7 +55,6 @@ func parseOptions(_ args: [String]) -> Options {
 }
 
 enum Command {
-  case frame(String)
   case show
   case hide
   case resize(CGFloat)
@@ -75,7 +77,6 @@ func parseCommand(_ raw: String) -> Command? {
     argument = ""
   }
   switch verb {
-  case "frame" where !argument.isEmpty: return .frame(argument)
   case "snapshot" where !argument.isEmpty: return .snapshot(argument)
   case "resize":
     guard let factor = Double(argument), factor > 0 else {
@@ -98,8 +99,7 @@ func parseCommand(_ raw: String) -> Command? {
   }
 }
 
-// Commands waiting for the main thread. A new frame replaces a frame that
-// is still waiting at the end, so the queue cannot grow from frames.
+// Commands waiting for the main thread.
 final class Inbox: @unchecked Sendable {
   private let lock = NSLock()
   private var commands: [Command] = []
@@ -109,11 +109,7 @@ final class Inbox: @unchecked Sendable {
   func push(_ command: Command) -> Bool {
     lock.lock()
     defer { lock.unlock() }
-    if case .frame = command, let last = commands.last, case .frame = last {
-      commands[commands.count - 1] = command
-    } else {
-      commands.append(command)
-    }
+    commands.append(command)
     if scheduled { return false }
     scheduled = true
     return true
@@ -127,6 +123,65 @@ final class Inbox: @unchecked Sendable {
     scheduled = false
     return taken
   }
+}
+
+// The newest decoded frame waiting for the main thread. A new frame replaces
+// one that is still waiting, so frames cannot pile up.
+final class FrameSlot: @unchecked Sendable {
+  private let lock = NSLock()
+  private var image: CGImage?
+  private var scheduled = false
+
+  // Returns true when the caller must schedule a drain on the main thread.
+  func push(_ newImage: CGImage) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    image = newImage
+    if scheduled { return false }
+    scheduled = true
+    return true
+  }
+
+  func take() -> CGImage? {
+    lock.lock()
+    defer { lock.unlock() }
+    let taken = image
+    image = nil
+    scheduled = false
+    return taken
+  }
+}
+
+// Reads exactly `count` bytes from `fd`, through short reads. Nil at end of
+// file or on an error.
+func readExact(_ fd: Int32, _ count: Int) -> Data? {
+  var data = Data(count: count)
+  var done = 0
+  while done < count {
+    let got = data.withUnsafeMutableBytes { buffer in
+      read(fd, buffer.baseAddress! + done, count - done)
+    }
+    if got > 0 {
+      done += got
+    } else if got < 0 && errno == EINTR {
+      continue
+    } else {
+      if got < 0 { warn("frame stream: read failed: \(String(cString: strerror(errno)))") }
+      return nil
+    }
+  }
+  return data
+}
+
+// The frame stream gives no reason to make a frame this large; a larger length
+// means the stream is broken.
+let maxFrameBytes = 64 << 20
+
+// Decodes the image now, on the calling thread, so the main thread only sets it.
+func decodeFrame(_ data: Data) -> CGImage? {
+  guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+  let options = [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+  return CGImageSourceCreateImageAtIndex(source, 0, options)
 }
 
 final class CornerPanel: NSPanel {
@@ -330,7 +385,6 @@ final class Corner {
     for command in commands {
       autoreleasepool {
         switch command {
-        case .frame(let path): showFrame(path)
         case .show:
           panel.orderFrontRegardless()
           panel.invalidateShadow()
@@ -349,18 +403,11 @@ final class Corner {
     }
   }
 
-  // A missing or broken file is skipped silently: the sender deletes old frames.
-  private func showFrame(_ path: String) {
-    guard let data = FileManager.default.contents(atPath: path),
-      let rep = NSBitmapImageRep(data: data), rep.pixelsWide > 0, rep.pixelsHigh > 0
-    else { return }
+  func showFrame(_ frame: CGImage) {
+    guard frame.width > 0, frame.height > 0 else { return }
     let scale = max(panel.backingScaleFactor, 1)
-    let size = NSSize(
-      width: CGFloat(rep.pixelsWide) / scale, height: CGFloat(rep.pixelsHigh) / scale)
-    rep.size = size
-    let image = NSImage(size: size)
-    image.addRepresentation(rep)
-    frameView.imageView.image = image
+    let size = NSSize(width: CGFloat(frame.width) / scale, height: CGFloat(frame.height) / scale)
+    frameView.imageView.image = NSImage(cgImage: frame, size: size)
   }
 
   private func snapshot(_ path: String) {
@@ -387,6 +434,7 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let corner = MainActor.assumeIsolated { Corner(options: options) }
 let inbox = Inbox()
+let frameSlot = FrameSlot()
 
 signal(SIGTERM, SIG_IGN)
 let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -407,4 +455,25 @@ let reader = Thread {
   enqueue(.end)
 }
 reader.start()
+
+// A frame that does not decode is skipped.
+let frameReader = Thread {
+  while let header = readExact(3, 4) {
+    let length = header.reduce(0) { $0 << 8 | Int($1) }
+    guard length <= maxFrameBytes else {
+      warn("frame stream: bad length \(length)")
+      return
+    }
+    guard let data = readExact(3, length) else { return }
+    guard let frame = decodeFrame(data), frameSlot.push(frame) else { continue }
+    DispatchQueue.main.async {
+      MainActor.assumeIsolated {
+        autoreleasepool {
+          if let newest = frameSlot.take() { corner.showFrame(newest) }
+        }
+      }
+    }
+  }
+}
+frameReader.start()
 app.run()
