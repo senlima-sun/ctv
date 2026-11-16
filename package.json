@@ -3,12 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "lint": "oxlint",
-    "fmt": "oxfmt",
-    "check": "oxfmt --check && oxlint"
-  },
-  "devDependencies": {
-    "oxfmt": "0.78.0",
-    "oxlint": "1.93.0"
+    "lint": "npx --yes oxlint@1.93.0",
+    "fmt": "npx --yes oxfmt@0.78.0",
+    "check": "npx --yes oxfmt@0.78.0 --check && npx --yes oxlint@1.93.0"
   }
 }

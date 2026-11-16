@@ -73,12 +73,11 @@ rm -rf ~/Library/Application\ Support/ctv
 ## Development
 
 ```
-npm install
 npm run check
 claude plugin test .
 ```
 
-`npm install` gets the dev tools only (oxlint and oxfmt); the mod has no runtime dependencies. `npm run fmt` formats the files.
+`npm run check` runs oxfmt and oxlint through `npx` at pinned versions, so the repo has no dependencies at all and an install pulls nothing extra. `npm run fmt` formats the files.
 
 ## Notes
 
