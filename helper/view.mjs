@@ -719,8 +719,15 @@ const PLAYBACK_ACCESS_TOKEN = `query PlaybackAccessToken($login: String!, $isLiv
 }`;
 const TWITCH_CHANNEL = `query($login: String!) { user(login: $login) { displayName stream { title } } }`;
 const TWITCH_VIDEO = `query($id: ID!) { video(id: $id) { title owner { displayName } } }`;
-const TWITCH_STREAM_FIELDS = `login displayName stream { title viewersCount game { displayName } }`;
-const TWITCH_FOLLOWED = `query { currentUser { followedLiveUsers(first: 15) { edges { node { ${TWITCH_STREAM_FIELDS} } } } } }`;
+// Twitch answers "service error" for the follows of the person in a plain
+// query; its web client's own persisted query for the following page works.
+const TWITCH_FOLLOWED = {
+  operationName: "FollowingLive_CurrentUser",
+  variables: { imageWidth: 50, limit: 30, includeCostreaming: false },
+  extensions: {
+    persistedQuery: { version: 1, sha256Hash: "bbfa83064e90280dce3eaa9de3a18eb6647505546336313241afdf569b6b34b6" },
+  },
+};
 const TWITCH_SEARCH = `query($query: String!) { searchStreams(userQuery: $query, first: 15) { edges { node { title viewersCount game { displayName } broadcaster { login displayName } } } } }`;
 
 // Sends GQL requests (one batch) from a twitch.tv page, as Twitch's web
@@ -792,13 +799,14 @@ async function findTwitchStream({ login, vod }) {
 // `query` (Twitch search). At most 15.
 async function listTwitch(query) {
   const { loggedIn, data } = await twitchGql(
-    query ? [{ query: TWITCH_SEARCH, variables: { query } }] : [{ query: TWITCH_FOLLOWED }],
+    query ? [{ query: TWITCH_SEARCH, variables: { query } }] : [TWITCH_FOLLOWED],
   );
   const users = query
     ? (data[0].searchStreams?.edges ?? []).map(({ node }) => node.broadcaster && { ...node.broadcaster, stream: node })
     : (data[0].currentUser?.followedLiveUsers?.edges ?? []).map(({ node }) => node);
   const items = users
     .filter((user) => user?.stream)
+    .sort((a, b) => b.stream.viewersCount - a.stream.viewersCount)
     .slice(0, 15)
     .map(({ login, displayName, stream }) => ({
       id: login,
@@ -840,7 +848,10 @@ const LIST_VIDEOS = (live) => `((live) => {
       const m = l.metadata && l.metadata.lockupMetadataViewModel;
       const rows = m && m.metadata && m.metadata.contentMetadataViewModel && m.metadata.contentMetadataViewModel.metadataRows;
       const part = rows && rows[0] && rows[0].metadataParts && rows[0].metadataParts[0];
-      add(l.contentId, text(m && m.title), text(part && part.text), "");
+      // The duration is the text of a badge on the thumbnail (a live item has
+      // a "LIVE" badge instead).
+      const badge = JSON.stringify(l.contentImage || {}).match(/"text":"(\\d+(?::\\d\\d)+)"/);
+      add(l.contentId, text(m && m.title), text(part && part.text), badge ? badge[1] : "");
     }
     for (const key in node) walk(node[key], depth + 1);
   };
