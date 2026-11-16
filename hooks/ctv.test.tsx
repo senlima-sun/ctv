@@ -105,7 +105,9 @@ test('/ctv lists, plays by number, hides, lists home and pauses', async ($, on) 
   expect(body(last('/cast'))).toEqual({ on: true })
 
   // No argument with a video loaded: hide.
-  await $.command.run({ ...RUN, args: '' })
+  expect(await $.command.run({ ...RUN, args: '' })).toEqual({
+    text: 'YouTube window hidden. Sound keeps playing.',
+  })
   expect(body(last('/cast'))).toEqual({ on: false })
 
   // `home` lists the home feed, also while a video is loaded.
@@ -212,6 +214,8 @@ test('/ctv twitch lists who you follow, plays by number, searches and asks to si
   await $.command.run({ ...RUN, args: '1' })
   await cast
   expect(body(last('/navigate'))).toEqual({ url: 'https://www.twitch.tv/cat' })
+  // Messages name the site that plays.
+  expect(await $.command.run({ ...RUN, args: 'pause' })).toEqual({ text: 'Twitch: play/pause.' })
 
   // Signed out, the followed list asks for a Twitch sign-in.
   await $.command.run({ ...RUN, args: 'twitch' })

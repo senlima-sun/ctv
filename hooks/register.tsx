@@ -42,6 +42,9 @@ let ready: Promise<boolean> | null = null
 let videos: Video[] = []
 let listSite: Site = 'YouTube'
 let hasVideo = false
+// The site of the video loaded in the view, named in messages; null when none.
+let playingSite: Site | null = null
+const label = () => playingSite ?? 'ctv'
 const SIGNED_OUT = 'YouTube is signed out. Run /ctv login to sign in once.'
 const TWITCH_SIGNED_OUT = 'Twitch is signed out. Run /ctv login twitch to sign in once.'
 
@@ -148,6 +151,7 @@ async function onLine($: EngineInterface, line: string, markReady: (ok: boolean)
 
 async function reset($: EngineInterface) {
   hasVideo = false
+  playingSite = null
   await update($, running, () => false)
   await update($, shown, () => false)
   await update($, title, () => '')
@@ -182,7 +186,7 @@ async function pump($: EngineInterface, stream: Child, markReady: (ok: boolean) 
   if (child === stream) {
     child = null
     await reset($)
-    $.ui.toast('YouTube stopped.')
+    $.ui.toast('ctv stopped.')
   }
 }
 
@@ -319,6 +323,7 @@ async function play($: EngineInterface, url: string) {
     return
   }
   hasVideo = true
+  playingSite = siteOf(url)
   await show($)
 }
 
@@ -355,7 +360,7 @@ export const register: Register = on => {
       await stopHelper($)
       await reset($)
 
-      return { text: 'YouTube stopped.' }
+      return { text: 'ctv stopped.' }
     }
 
     if (args === 'login') {
@@ -385,7 +390,7 @@ export const register: Register = on => {
         await control($, 'POST', '/gray', { on: isGray })
       }
 
-      return { text: `YouTube: black and white ${isGray ? 'on' : 'off'}.` }
+      return { text: `${label()}: black and white ${isGray ? 'on' : 'off'}.` }
     }
 
     if (args === 'mute' || args === 'unmute') {
@@ -395,25 +400,25 @@ export const register: Register = on => {
         await control($, 'POST', '/mute', { on: isMuted })
       }
 
-      return { text: `YouTube: sound ${isMuted ? 'off' : 'on'}.` }
+      return { text: `${label()}: sound ${isMuted ? 'off' : 'on'}.` }
     }
 
     if (args === 'bigger' || args === 'smaller') {
       if (child === null) {
-        return { text: 'YouTube: nothing is playing.' }
+        return { text: 'ctv: nothing is playing.' }
       }
       await control($, 'POST', '/resize', { factor: args === 'bigger' ? 1.25 : 0.8 })
 
-      return { text: `YouTube window ${args}.` }
+      return { text: `${label()} window ${args}.` }
     }
 
     if (args === 'pause') {
       if (!hasVideo) {
-        return { text: 'YouTube: nothing is playing.' }
+        return { text: 'ctv: nothing is playing.' }
       }
       await control($, 'POST', '/toggle')
 
-      return { text: 'YouTube: play/pause.' }
+      return { text: `${label()}: play/pause.` }
     }
 
     if (/^\d+$/.test(args)) {
@@ -458,11 +463,11 @@ export const register: Register = on => {
       if (await read($, shown)) {
         await hide($)
 
-        return { text: 'YouTube window hidden. Sound keeps playing.' }
+        return { text: `${label()} window hidden. Sound keeps playing.` }
       }
       await show($)
 
-      return { text: 'YouTube window shown.' }
+      return { text: `${label()} window shown.` }
     }
     background($, listVideos($, youtubeList(HOME_URL, 'home')))
 
