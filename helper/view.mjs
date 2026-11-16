@@ -608,7 +608,10 @@ async function evaluate(expression) {
 async function isLoggedIn() {
   try {
     return (
-      (await evaluate(`(() => { try { return !!(window.ytcfg && window.ytcfg.get("LOGGED_IN")); } catch { return false; } })()`)) === true
+      (await evaluate(`(() => { try {
+        if (/(^|\\.)twitch\\.tv$/.test(location.hostname)) return /(?:^|; )auth-token=/.test(document.cookie);
+        return !!(window.ytcfg && window.ytcfg.get("LOGGED_IN"));
+      } catch { return false; } })()`)) === true
     );
   } catch {
     return false;

@@ -1,5 +1,15 @@
 {
   "name": "ctv",
   "owner": { "name": "Senlima Sun" },
-  "plugins": [{ "name": "ctv", "source": "./" }]
+  "metadata": {
+    "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide."
+  },
+  "plugins": [
+    {
+      "name": "ctv",
+      "source": "./",
+      "description": "A small live video in a floating panel at the bottom-right of the screen: YouTube and Twitch. List, play, hide.",
+      "author": { "name": "Senlima Sun" }
+    }
+  ]
 }
