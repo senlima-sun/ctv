@@ -1,10 +1,10 @@
 {
-  "printWidth": 120,
+  "printWidth": 100,
   "ignorePatterns": [".claude-plugin/types/**", "node_modules/**", "package-lock.json"],
   "overrides": [
     {
       "files": ["hooks/**", "types/**"],
-      "options": { "printWidth": 100, "singleQuote": true, "semi": false, "arrowParens": "avoid" }
+      "options": { "singleQuote": true, "semi": false, "arrowParens": "avoid" }
     }
   ]
 }

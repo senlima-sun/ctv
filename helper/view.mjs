@@ -1,14 +1,8 @@
 #!/usr/bin/env node
-// view: run a headless Chrome that shows YouTube and send the page picture
-// as JPEG frames to the floating panel over a pipe (its fd 3). A Twitch live
-// channel or video plays in the panel itself instead (its AVPlayer, from the
-// HLS URL that Twitch gives its web player): the page then goes to about:blank
-// and no frames are sent, which costs much less CPU. Zero npm dependencies
-// (Node 22).
-//
-// stdout: one JSON object per line (ready / nav / error).
-// stderr: diagnostics.
+// ctv view: headless Chrome, its page sent as JPEG frames to the panel; Twitch plays in the panel.
+// stdout: one JSON line per event (ready / nav / error); stderr: diagnostics.
 // control: HTTP server on <run-dir>/control.sock.
+// panel: commands on stdin, stream state on stdout, frames on fd 3 (4-byte BE length + JPEG).
 
 import { spawn, execFile, execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -17,7 +11,6 @@ import os from "node:os";
 import path from "node:path";
 import { parseArgs, promisify } from "node:util";
 
-// The panel is AppKit and AVPlayer, and Chrome is found in /Applications.
 if (process.platform !== "darwin") {
   emit({ t: "error", message: "ctv supports macOS only." });
   process.exit(2);
@@ -25,76 +18,40 @@ if (process.platform !== "darwin") {
 
 const CHROME_APP = "/Applications/Google Chrome.app";
 const CHROME_BIN = `${CHROME_APP}/Contents/MacOS/Google Chrome`;
-const LOGIN_URL = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
+const LOGIN_URL =
+  "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F";
 const TWITCH_LOGIN_URL = "https://www.twitch.tv/login";
 // The Client-ID of Twitch's own web player (Streamlink sends it too).
 const TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
-// A small twitch.tv document: Twitch GQL requests run there, so they carry the
-// person's Twitch cookies.
+// GQL requests run in a twitch.tv document so they carry the person's Twitch cookies.
 const TWITCH_PAGE = "https://www.twitch.tv/robots.txt";
-// The page of the live channels the person follows: its own GQL request has
-// the hash of the following query (see twitchFollowed).
+// This page's own GQL request carries the hash of the following query.
 const TWITCH_FOLLOWING_PAGE = "https://www.twitch.tv/directory/following/live";
 // First path parts of twitch.tv that are not a channel.
-const TWITCH_RESERVED = new Set([
-  "directory",
-  "videos",
-  "settings",
-  "search",
-  "downloads",
-  "p",
-  "subscriptions",
-  "inventory",
-  "wallet",
-  "drops",
-  "friends",
-  "messages",
-  "payments",
-  "prime",
-  "turbo",
-  "jobs",
-  "store",
-  "login",
-  "signup",
-  "logout",
-  "popout",
-  "moderator",
-  "embed",
-  "broadcast",
-  "u",
-  "privacy",
-  "team",
-  "products",
-  "bits",
-  "following",
-  "clips",
-  "redeem",
-]);
+const TWITCH_RESERVED = new Set(
+  (
+    "directory videos settings search downloads p subscriptions inventory wallet drops friends " +
+    "messages payments prime turbo jobs store login signup logout popout moderator embed " +
+    "broadcast u privacy team products bits following clips redeem"
+  ).split(" "),
+);
 const MAX_FPS = 24;
 const CDP_TIMEOUT_MS = 10000;
-// A playing video that sends no frame for this long means Chrome stopped the
-// screencast (it waits for acks): the watchdog starts it again.
+// Chrome stops the screencast when it waits for acks; a longer gap while a video plays restarts it.
 const FRAME_STALL_MS = 3000;
-// How long POST /toggle waits for the panel's answer while a stream plays.
 const PANEL_ANSWER_MS = 3000;
-// The floating panel that shows the frames: a small Swift program, built once
-// from the source beside this file. The binary lives outside the mod folder so
-// writing it does not reload the mod.
 const PANEL_SRC = path.join(import.meta.dirname, "panel.swift");
 const DATA_DIR = path.join(os.homedir(), "Library/Application Support/ctv");
+// Outside the mod folder, so building the panel does not reload the mod.
 const PANEL_BIN = path.join(DATA_DIR, "ctv-panel");
 const SUN_PATH_MAX = 103;
 
-// The mod was named yt-corner before: move its data dir once, so the Chrome
-// profile and its Google sign-in stay. The old panel binary is built again
-// under its new name.
+// The mod was named yt-corner: keep its profile (and Google sign-in); the panel is built again.
 const OLD_DATA_DIR = path.join(os.homedir(), "Library/Application Support/yt-corner");
 if (!fs.existsSync(DATA_DIR) && fs.existsSync(OLD_DATA_DIR)) {
   fs.renameSync(OLD_DATA_DIR, DATA_DIR);
   fs.rmSync(path.join(DATA_DIR, "yt-panel"), { force: true });
 }
-
-// ---------- args ----------
 
 const { values: args } = parseArgs({
   options: {
@@ -112,10 +69,7 @@ const { values: args } = parseArgs({
   },
 });
 
-// --login: open a normal, visible Chrome window on the helper's profile so the
-// person signs in to Google once. No debugging flags: Google refuses sign-in
-// in an automated browser. --login-twitch: the same window on Twitch's sign-in
-// page.
+// A normal visible Chrome without debugging flags: Google refuses sign-in in an automated browser.
 if (args.login || args["login-twitch"]) {
   fs.mkdirSync(path.resolve(args.profile), { recursive: true });
   execFileSync("/usr/bin/open", [
@@ -142,8 +96,6 @@ const height = Number(args.height);
 const scale = Number(args.scale);
 const sockPath = path.join(runDir, "control.sock");
 
-// ---------- output ----------
-
 function emit(obj) {
   process.stdout.write(`${JSON.stringify(obj)}\n`);
 }
@@ -152,18 +104,14 @@ function log(...parts) {
   process.stderr.write(`[ctv-view] ${parts.join(" ")}\n`);
 }
 
-// ---------- CDP client ----------
-
-// Chrome runs with --remote-debugging-pipe: it reads commands from fd 3 and
-// writes replies and events to fd 4. Each message is one JSON text and a NUL.
+// --remote-debugging-pipe: commands on fd 3, replies and events on fd 4, each JSON text + NUL.
 class Cdp {
   constructor(output, input) {
     this.nextId = 1;
     this.pending = new Map();
     this.handlers = new Map();
     this.closed = false;
-    // Bytes after the last NUL: kept as Buffers and decoded at the next NUL, so
-    // a UTF-8 character split between two reads stays whole.
+    // Bytes stay Buffers until the NUL, so a UTF-8 character split between reads stays whole.
     this.chunks = [];
     this.output = output;
     this.input = input;
@@ -226,8 +174,6 @@ class Cdp {
     });
   }
 
-  // Several handlers may listen to one method. Returns a function that removes
-  // this handler only.
   on(method, fn) {
     let fns = this.handlers.get(method);
     if (!fns) this.handlers.set(method, (fns = new Set()));
@@ -241,8 +187,6 @@ class Cdp {
   }
 }
 
-// ---------- state ----------
-
 let chrome = null;
 let cdp = null;
 let session = null;
@@ -255,7 +199,6 @@ let muted = false;
 let mutedScript = null;
 let lastFrameAt = 0;
 let lastRawFrameAt = 0;
-// The panel's frame pipe is full: drop frames until it drains.
 let panelBusy = false;
 let watchdog = null;
 let watchdogBusy = false;
@@ -263,15 +206,10 @@ let pointerDown = false;
 let lastUrl = "";
 let lastTitle = "";
 let shuttingDown = false;
-// A stream plays in the panel (stream mode): the page is about:blank.
 let streaming = false;
-// The page of the stream, to go back to when the stream fails.
 let streamUrl = "";
 let streamLoggedIn = false;
-// Waits for the panel's answer to play / pause / toggle, oldest first.
 let panelAnswers = [];
-
-// ---------- Chrome ----------
 
 function userAgent() {
   let version = "157.0.0.0";
@@ -279,21 +217,15 @@ function userAgent() {
     version = execFileSync(
       "/usr/bin/plutil",
       ["-extract", "CFBundleShortVersionString", "raw", `${CHROME_APP}/Contents/Info.plist`],
-      {
-        encoding: "utf8",
-      },
+      { encoding: "utf8" },
     ).trim();
   } catch {}
   const major = version.split(".")[0];
   return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
 }
 
-// Chrome keeps a `SingletonLock` symlink ("<host>-<pid>") while a profile is open.
-// The sign-in window of `--login` holds it until that Chrome quits; closing its
-// window is not enough on macOS. Quit that Chrome here, and only that one: its
-// command line must name this profile. A headless holder is the player of a
-// helper: while its helper lives (parent is not pid 1) it belongs to another
-// session and stays; an orphan is quit too.
+// The --login Chrome holds SingletonLock until it quits; closing its window is not enough on macOS.
+// A headless holder whose helper still lives (ppid is not 1) belongs to another session.
 async function releaseProfile() {
   let pid;
   try {
@@ -302,13 +234,16 @@ async function releaseProfile() {
   } catch {
     return;
   }
-  const command = execFileSync("/bin/ps", ["-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+  const ps = (field) =>
+    execFileSync("/bin/ps", ["-ww", "-o", `${field}=`, "-p", String(pid)], { encoding: "utf8" });
+  const command = ps("command");
   if (!command.includes(`--user-data-dir=${profileDir}`)) {
     throw new Error("The YouTube profile is in use by another program.");
   }
   if (command.includes("--headless")) {
-    const ppid = Number(execFileSync("/bin/ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8" }).trim());
-    if (ppid !== 1) throw new Error("YouTube is playing in another Claude session. Run /ctv off there first.");
+    if (Number(ps("ppid").trim()) !== 1) {
+      throw new Error("YouTube is playing in another Claude session. Run /ctv off there first.");
+    }
     log("quitting an orphaned player Chrome, pid", pid);
   } else {
     log("quitting the sign-in Chrome, pid", pid);
@@ -325,7 +260,7 @@ async function releaseProfile() {
   throw new Error("The sign-in Chrome window did not quit. Quit it (Cmd+Q), then run /ctv again.");
 }
 
-async function startChrome() {
+function startChrome() {
   const chromeArgs = [
     "--headless=new",
     `--user-data-dir=${profileDir}`,
@@ -336,9 +271,8 @@ async function startChrome() {
     `--user-agent=${userAgent()}`,
     `--window-size=${width},${height}`,
     `--force-device-scale-factor=${scale}`,
+    "about:blank",
   ];
-  chromeArgs.push("about:blank");
-
   chrome = spawn(CHROME_BIN, chromeArgs, { stdio: ["ignore", "ignore", "pipe", "pipe", "pipe"] });
   chrome.stderr.on("data", (d) => process.stderr.write(d));
   chrome.on("exit", (code, signal) => {
@@ -357,16 +291,17 @@ async function startChrome() {
 }
 
 async function attachPage() {
-  // The first request also waits for a cold Chrome start.
+  // The long timeout covers a cold Chrome start.
   const { targetInfos } = await cdp.send("Target.getTargets", {}, undefined, 60000);
   const page = targetInfos.find((t) => t.type === "page");
-  targetId = page ? page.targetId : (await cdp.send("Target.createTarget", { url: "about:blank" })).targetId;
+  targetId = page
+    ? page.targetId
+    : (await cdp.send("Target.createTarget", { url: "about:blank" })).targetId;
   ({ sessionId: session } = await cdp.send("Target.attachToTarget", { targetId, flatten: true }));
 
   cdp.on("Target.targetInfoChanged", ({ targetInfo }) => {
-    if (targetInfo.targetId !== targetId) return;
-    // In stream mode the page is about:blank; the video stays the page.
-    if (streaming) return;
+    // In stream mode the page is about:blank and the stream's page stays the reported one.
+    if (targetInfo.targetId !== targetId || streaming) return;
     if (targetInfo.url === lastUrl && targetInfo.title === lastTitle) return;
     lastUrl = targetInfo.url;
     lastTitle = targetInfo.title;
@@ -385,9 +320,7 @@ async function attachPage() {
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: VIDEO_ONLY }, session);
 }
 
-// On a watch page (YouTube) or a channel or video page (Twitch) the view is the
-// video alone: the player fills the viewport and the rest of the page is under
-// it. Other pages (home, search) stay whole.
+// On a YouTube watch page or a Twitch channel / video page the player fills the viewport.
 const VIDEO_ONLY = `(() => {
   const reserved = new Set(${JSON.stringify([...TWITCH_RESERVED])});
   const css = [
@@ -418,7 +351,7 @@ const VIDEO_ONLY = `(() => {
     root.classList.toggle("ctv-twitch", twitchPlayer());
     window.dispatchEvent(new Event("resize"));
   };
-  // Muted is the helper's: every video that loads or plays stays silent.
+  // The page unmutes its own videos; while the helper mutes, every load or play goes silent again.
   const hush = (e) => {
     if (window.__ctvMuted && e.target instanceof HTMLMediaElement) e.target.muted = true;
   };
@@ -428,8 +361,7 @@ const VIDEO_ONLY = `(() => {
   document.addEventListener("DOMContentLoaded", apply);
   document.addEventListener("yt-navigate-finish", apply);
   document.addEventListener("yt-page-data-updated", apply);
-  // Twitch moves between pages with history.pushState and no event: look at
-  // the path once a second.
+  // Twitch moves between pages with history.pushState and fires no event.
   if (/(^|\\.)twitch\\.tv$/.test(location.hostname)) {
     let shown = location.pathname;
     setInterval(() => {
@@ -441,21 +373,16 @@ const VIDEO_ONLY = `(() => {
   apply();
 })();`;
 
-// ---------- frames ----------
-
 function onFrame({ data, sessionId: frameSession }, sessionId) {
   cdp.send("Page.screencastFrameAck", { sessionId: frameSession }, sessionId).catch(() => {});
-  lastRawFrameAt = performance.now();
-  if (!casting) return;
   const now = performance.now();
-  if (now - lastFrameAt < 1000 / MAX_FPS) return;
+  lastRawFrameAt = now;
+  if (!casting || now - lastFrameAt < 1000 / MAX_FPS) return;
   lastFrameAt = now;
   frameToPanel(Buffer.from(data, "base64"));
 }
 
-// One frame on the panel's fd 3: a 4-byte big-endian length, then the JPEG.
-// At most one frame waits in Node: while the pipe is full, new frames are
-// dropped, and the panel shows the newest frame that got through.
+// While the pipe is full new frames are dropped, so no backlog builds up in Node.
 function frameToPanel(image) {
   const stream = panel?.stdio[3];
   if (!stream || !stream.writable || panelBusy) return;
@@ -474,11 +401,14 @@ function toPanel(line) {
 
 async function ensurePanel() {
   if (args["no-panel"] || panel) return;
-  const built = fs.existsSync(PANEL_BIN) && fs.statSync(PANEL_BIN).mtimeMs >= fs.statSync(PANEL_SRC).mtimeMs;
+  const built =
+    fs.existsSync(PANEL_BIN) && fs.statSync(PANEL_BIN).mtimeMs >= fs.statSync(PANEL_SRC).mtimeMs;
   if (!built) {
     log("building the panel");
     fs.mkdirSync(path.dirname(PANEL_BIN), { recursive: true });
-    await promisify(execFile)("/usr/bin/swiftc", ["-O", PANEL_SRC, "-o", PANEL_BIN], { timeout: 180000 });
+    await promisify(execFile)("/usr/bin/swiftc", ["-O", PANEL_SRC, "-o", PANEL_BIN], {
+      timeout: 180000,
+    });
   }
   const child = spawn(PANEL_BIN, ["--width", String(width), "--height", String(height)], {
     stdio: ["pipe", "pipe", "pipe", "pipe"],
@@ -503,8 +433,7 @@ async function ensurePanel() {
   panel = child;
 }
 
-// The panel's stdout: stream state lines. The line after play / pause /
-// toggle answers it; a failed stream goes back to the page.
+// A stream state line answers the oldest askPanel; "failed" goes back to the page.
 function onPanelLine(line) {
   let msg;
   try {
@@ -515,14 +444,14 @@ function onPanelLine(line) {
   }
   if (msg.t !== "stream") return;
   if (msg.state === "failed") {
-    streamFailed(msg.message ?? "unknown error").catch((err) => log("cannot go back to the page:", err.message));
+    streamFailed(msg.message ?? "unknown error").catch((err) =>
+      log("cannot go back to the page:", err.message),
+    );
     return;
   }
   panelAnswers.shift()?.(msg.state);
 }
 
-// Sends play / pause / toggle to the panel and waits for the state after it
-// (playing, paused or none); null when the panel does not answer.
 function askPanel(command) {
   return new Promise((resolve) => {
     const answer = (state) => {
@@ -538,19 +467,23 @@ function askPanel(command) {
   });
 }
 
-// Black and white: Chrome draws the whole page without color (its emulation of
-// achromatopsia), so every frame and every later page is gray too.
 async function setGray(on) {
-  await cdp.send("Emulation.setEmulatedVisionDeficiency", { type: on ? "achromatopsia" : "none" }, session);
+  await cdp.send(
+    "Emulation.setEmulatedVisionDeficiency",
+    { type: on ? "achromatopsia" : "none" },
+    session,
+  );
   if (streaming) toPanel(`gray ${on ? "on" : "off"}`);
   gray = on;
 }
 
-// Mute: a flag the page script reads, set again on every new document, and
-// applied now to the videos already there. Unmute gives back YouTube's sound.
 async function setMuted(on) {
   if (mutedScript !== null) {
-    await cdp.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: mutedScript }, session);
+    await cdp.send(
+      "Page.removeScriptToEvaluateOnNewDocument",
+      { identifier: mutedScript },
+      session,
+    );
   }
   ({ identifier: mutedScript } = await cdp.send(
     "Page.addScriptToEvaluateOnNewDocument",
@@ -566,20 +499,12 @@ async function setMuted(on) {
 }
 
 async function setCasting(on) {
-  if (on) {
-    await ensurePanel();
-    toPanel("show");
-  } else {
-    toPanel("hide");
-  }
+  if (on) await ensurePanel();
+  toPanel(on ? "show" : "hide");
   if (on === casting) return;
-  // In stream mode the panel plays the stream: no screencast.
   if (!streaming) {
-    if (on) {
-      await startScreencast();
-    } else {
-      await cdp.send("Page.stopScreencast", {}, session);
-    }
+    if (on) await startScreencast();
+    else await cdp.send("Page.stopScreencast", {}, session);
   }
   casting = on;
   if (on && !streaming) startWatchdog();
@@ -587,21 +512,17 @@ async function setCasting(on) {
 }
 
 async function startScreencast() {
-  // Right after a navigation the page is between two renderers and Chrome
-  // answers "Not attached to an active page": try again until it is there.
+  const params = {
+    format: "jpeg",
+    quality: 80,
+    maxWidth: Math.round(width * scale),
+    maxHeight: Math.round(height * scale),
+    everyNthFrame: 1,
+  };
+  // Right after a navigation the page is between renderers and Chrome answers "Not attached".
   for (let attempt = 0; ; attempt++) {
     try {
-      await cdp.send(
-        "Page.startScreencast",
-        {
-          format: "jpeg",
-          quality: 80,
-          maxWidth: Math.round(width * scale),
-          maxHeight: Math.round(height * scale),
-          everyNthFrame: 1,
-        },
-        session,
-      );
+      await cdp.send("Page.startScreencast", params, session);
       return;
     } catch (err) {
       if (attempt >= 40 || !/Not attached/.test(err.message)) throw err;
@@ -609,8 +530,6 @@ async function startScreencast() {
     }
   }
 }
-
-// ---------- frame watchdog ----------
 
 // A still page sends no frames, so a gap only counts while a video plays.
 const VIDEO_PLAYING = `(() => { const v = document.querySelector("video"); return !!v && !v.paused && !v.ended && v.readyState >= 2; })()`;
@@ -656,8 +575,6 @@ async function checkFrames() {
   }
 }
 
-// ---------- page helpers ----------
-
 async function evaluate(expression) {
   const res = await cdp.send("Runtime.evaluate", { expression, returnByValue: true }, session);
   return res.result?.value;
@@ -676,8 +593,8 @@ async function isLoggedIn() {
   }
 }
 
-async function navigate(url) {
-  const res = await cdp.send("Page.navigate", { url }, session);
+async function navigate(url, sessionId = session) {
+  const res = await cdp.send("Page.navigate", { url }, sessionId);
   if (res.errorText) throw new Error(`navigate failed: ${res.errorText}`);
 }
 
@@ -696,11 +613,7 @@ function waitForLoad(timeoutMs) {
   });
 }
 
-// ---------- streams ----------
-
-// Stream mode: the panel plays `stream.hls`, the page goes to about:blank so
-// it does not decode the video or play its sound too. The stream's page stays
-// the page (lastUrl, lastTitle). A new stream replaces the one that plays.
+// The page goes to about:blank so it does not decode the video or play its sound too.
 async function startStream(stream) {
   await ensurePanel();
   const wasStreaming = streaming;
@@ -720,7 +633,6 @@ async function startStream(stream) {
   await navigate("about:blank");
 }
 
-// Leaves stream mode; the page shows again when the view is cast.
 async function stopStream() {
   if (!streaming) return;
   toPanel("stream-stop");
@@ -738,9 +650,7 @@ async function streamFailed(message) {
   await navigate(streamUrl);
 }
 
-// Loads `url`. A Twitch channel or video plays in the panel instead; it is
-// found before anything changes, so an offline channel leaves the view as it
-// is. Returns whether it streams.
+// The Twitch stream is found before anything changes, so an offline channel leaves the view as is.
 async function openUrl(url) {
   const twitch = args["no-panel"] ? null : twitchTarget(url);
   if (!twitch) {
@@ -752,10 +662,6 @@ async function openUrl(url) {
   return true;
 }
 
-// ---------- Twitch ----------
-
-// A Twitch channel URL gives { login }, a Twitch video URL gives { vod }, any
-// other URL null.
 function twitchTarget(url) {
   let u;
   try {
@@ -770,31 +676,25 @@ function twitchTarget(url) {
   return login && !TWITCH_RESERVED.has(login) ? { login } : null;
 }
 
-// The query of Twitch's web player for the token and signature of a stream.
 const PLAYBACK_ACCESS_TOKEN = `query PlaybackAccessToken($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) {
   streamPlaybackAccessToken(channelName: $login, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isLive) { value signature }
   videoPlaybackAccessToken(id: $vodID, params: {platform: "web", playerBackend: "mediaplayer", playerType: $playerType}) @include(if: $isVod) { value signature }
 }`;
 const TWITCH_CHANNEL = `query($login: String!) { user(login: $login) { displayName stream { title } } }`;
 const TWITCH_VIDEO = `query($id: ID!) { video(id: $id) { title owner { displayName } } }`;
-// Twitch answers "service error" for the follows of the person in a plain
-// query; its web client's own persisted query for the following page works.
-// CTV_TWITCH_FOLLOW_HASH overrides the hash of that query. When Twitch no
-// longer knows the hash, the one its following page sends replaces it for this
-// run (see twitchFollowedGql).
+const TWITCH_SEARCH = `query($query: String!) { searchStreams(userQuery: $query, first: 15) { edges { node { title viewersCount game { displayName } broadcaster { login displayName } } } } }`;
+// A plain follows query gets "service error"; only the web client's persisted query works.
 const TWITCH_FOLLOWED_OPERATION = "FollowingLive_CurrentUser";
 let twitchFollowHash =
-  process.env.CTV_TWITCH_FOLLOW_HASH || "bbfa83064e90280dce3eaa9de3a18eb6647505546336313241afdf569b6b34b6";
+  process.env.CTV_TWITCH_FOLLOW_HASH ||
+  "bbfa83064e90280dce3eaa9de3a18eb6647505546336313241afdf569b6b34b6";
 const twitchFollowed = () => ({
   operationName: TWITCH_FOLLOWED_OPERATION,
   variables: { imageWidth: 50, limit: 30, includeCostreaming: false },
   extensions: { persistedQuery: { version: 1, sha256Hash: twitchFollowHash } },
 });
-const TWITCH_SEARCH = `query($query: String!) { searchStreams(userQuery: $query, first: 15) { edges { node { title viewersCount game { displayName } broadcaster { login displayName } } } } }`;
 
-// Sends GQL requests (one batch) from a twitch.tv page, as Twitch's web
-// player does: with its Client-ID and, when the person is signed in, their
-// auth-token (a Turbo subscriber then gets no ads).
+// Like Twitch's web player: its Client-ID, plus the auth-token when signed in (Turbo: no ads).
 const TWITCH_GQL = (requests) => `(async () => {
   const token = (document.cookie.match(/(?:^|; )auth-token=([^;]*)/) || [])[1] || "";
   const headers = { "Client-ID": ${JSON.stringify(TWITCH_CLIENT_ID)} };
@@ -804,7 +704,6 @@ const TWITCH_GQL = (requests) => `(async () => {
   return { loggedIn: !!token, results: await res.json() };
 })()`;
 
-// Returns { loggedIn, data }: data has the data of each request, in order.
 async function twitchGql(requests) {
   const out = await evaluateInTab(TWITCH_PAGE, TWITCH_GQL(requests));
   if (!out || out.error) throw new Error(out?.error ?? "Twitch did not answer");
@@ -814,14 +713,14 @@ async function twitchGql(requests) {
   return { loggedIn: out.loggedIn, data: out.results.map((one) => one.data) };
 }
 
-// The following query, with the hash of the following page when Twitch does
-// not know the hash any more (a persisted-query error). One retry.
 async function twitchFollowedGql() {
   try {
     return await twitchGql([twitchFollowed()]);
   } catch (err) {
     if (!/PersistedQuery/i.test(err.message)) throw err;
-    log(`Twitch refused the following query (${err.message}); reading its hash from the following page`);
+    log(
+      `Twitch refused the following query (${err.message}); reading its hash from the following page`,
+    );
   }
   const hash = await findTwitchFollowHash();
   if (!hash) throw new Error("Twitch changed its following query; update ctv.");
@@ -829,26 +728,19 @@ async function twitchFollowedGql() {
   return twitchGql([twitchFollowed()]);
 }
 
-// Loads the following page in a tab of its own and returns the hash of the
-// following query that the page sends (null after 15 s). A signed-out page
-// sends none.
-async function findTwitchFollowHash() {
-  const { targetId: tab } = await cdp.send("Target.createTarget", { url: "about:blank", background: true });
-  let off = () => {};
-  try {
-    const { sessionId: tabSession } = await cdp.send("Target.attachToTarget", { targetId: tab, flatten: true });
+function findTwitchFollowHash() {
+  return withTab(async (tabSession, on) => {
     await cdp.send("Network.enable", {}, tabSession);
     const hash = new Promise((resolve) => {
       const timer = setTimeout(resolve, 15000, null);
-      off = cdp.on("Network.requestWillBeSent", ({ request }, from) => {
-        if (from !== tabSession || !request.url.startsWith("https://gql.twitch.tv/gql")) return;
+      on("Network.requestWillBeSent", ({ request }) => {
+        if (!request.url.startsWith("https://gql.twitch.tv/gql")) return;
         let body;
         try {
           body = JSON.parse(request.postData ?? "null");
         } catch {
           return;
         }
-        // One request or a batch (an array).
         const one = [body].flat().find((op) => op?.operationName === TWITCH_FOLLOWED_OPERATION);
         const found = one?.extensions?.persistedQuery?.sha256Hash;
         if (!found) return;
@@ -856,17 +748,11 @@ async function findTwitchFollowHash() {
         resolve(found);
       });
     });
-    const res = await cdp.send("Page.navigate", { url: TWITCH_FOLLOWING_PAGE }, tabSession);
-    if (res.errorText) throw new Error(`navigate failed: ${res.errorText}`);
+    await navigate(TWITCH_FOLLOWING_PAGE, tabSession);
     return await hash;
-  } finally {
-    off();
-    await cdp.send("Target.closeTarget", { targetId: tab }).catch(() => {});
-  }
+  });
 }
 
-// The HLS URL of a Twitch channel's live stream or of a Twitch video, with the
-// page URL and the title. An offline channel is an error.
 async function findTwitchStream({ login, vod }) {
   const isVod = Boolean(vod);
   const {
@@ -876,9 +762,17 @@ async function findTwitchStream({ login, vod }) {
     {
       operationName: "PlaybackAccessToken",
       query: PLAYBACK_ACCESS_TOKEN,
-      variables: { isLive: !isVod, login: login ?? "", isVod, vodID: vod ?? "", playerType: "site" },
+      variables: {
+        isLive: !isVod,
+        login: login ?? "",
+        isVod,
+        vodID: vod ?? "",
+        playerType: "site",
+      },
     },
-    isVod ? { query: TWITCH_VIDEO, variables: { id: vod } } : { query: TWITCH_CHANNEL, variables: { login } },
+    isVod
+      ? { query: TWITCH_VIDEO, variables: { id: vod } }
+      : { query: TWITCH_CHANNEL, variables: { login } },
   ]);
   let token, base, url, title;
   if (isVod) {
@@ -908,18 +802,16 @@ async function findTwitchStream({ login, vod }) {
   return { hls, url, title, loggedIn };
 }
 
-// Which sites the browser is signed in to, from its cookies, without a page.
 async function signedIn() {
   const { cookies } = await cdp.send("Storage.getCookies");
-  const has = (names, domain) => cookies.some((c) => names.includes(c.name) && domain.test(c.domain));
+  const has = (names, domain) =>
+    cookies.some((c) => names.includes(c.name) && domain.test(c.domain));
   return {
     youtube: has(["SAPISID", "__Secure-3PSID"], /(^|\.)(google|youtube)\.com$/),
     twitch: has(["auth-token"], /(^|\.)twitch\.tv$/),
   };
 }
 
-// Live Twitch channels: the ones the person follows, or the ones that match
-// `query` (Twitch search). At most 15.
 async function listTwitch(query) {
   // Signed out, there are no follows to ask for (and no hash to recover).
   if (!query && !(await signedIn()).twitch) return { items: [], loggedIn: false };
@@ -927,7 +819,9 @@ async function listTwitch(query) {
     ? await twitchGql([{ query: TWITCH_SEARCH, variables: { query } }])
     : await twitchFollowedGql();
   const users = query
-    ? (data[0].searchStreams?.edges ?? []).map(({ node }) => node.broadcaster && { ...node.broadcaster, stream: node })
+    ? (data[0].searchStreams?.edges ?? []).map(
+        ({ node }) => node.broadcaster && { ...node.broadcaster, stream: node },
+      )
     : (data[0].currentUser?.followedLiveUsers?.edges ?? []).map(({ node }) => node);
   const items = users
     .filter((user) => user?.stream)
@@ -936,21 +830,18 @@ async function listTwitch(query) {
     .map(({ login, displayName, stream }) => ({
       id: login,
       title: stream.title || "",
-      channel: stream.game?.displayName ? `${displayName} · ${stream.game.displayName}` : displayName,
+      channel: stream.game?.displayName
+        ? `${displayName} · ${stream.game.displayName}`
+        : displayName,
       length: `${stream.viewersCount.toLocaleString("en-US")} watching`,
       url: `https://www.twitch.tv/${login}`,
     }));
   return { items, loggedIn };
 }
 
-// ---------- video list ----------
-
-// Reads the videos a YouTube page (home, search, subscriptions) holds in
-// `ytInitialData`: the page's own data, there before anything is drawn. With
-// `live`, only the items marked live now.
+// ytInitialData is the page's own data, there before anything is drawn.
 const LIST_VIDEOS = (live) => `((live) => {
   const items = [];
-  // A live-now badge or overlay anywhere in the item's own data.
   const isLive = (item) =>
     /"(BADGE_STYLE_TYPE_LIVE_NOW|THUMBNAIL_OVERLAY_BADGE_STYLE_LIVE)"|"style":"LIVE"/.test(JSON.stringify(item));
   const seen = new Set();
@@ -973,8 +864,7 @@ const LIST_VIDEOS = (live) => `((live) => {
       const m = l.metadata && l.metadata.lockupMetadataViewModel;
       const rows = m && m.metadata && m.metadata.contentMetadataViewModel && m.metadata.contentMetadataViewModel.metadataRows;
       const part = rows && rows[0] && rows[0].metadataParts && rows[0].metadataParts[0];
-      // The duration is the text of a badge on the thumbnail (a live item has
-      // a "LIVE" badge instead).
+      // The duration is a thumbnail badge (a live item has a "LIVE" badge instead).
       const badge = JSON.stringify(l.contentImage || {}).match(/"text":"(\\d+(?::\\d\\d)+)"/);
       add(l.contentId, text(m && m.title), text(part && part.text), badge ? badge[1] : "");
     }
@@ -995,45 +885,56 @@ const TOGGLE_PLAY = `(() => {
   return v.paused;
 })()`;
 
-// Loads `url` in a tab of its own, so a video in the view keeps playing, and
-// returns the value of `expression` there (a promise is waited for).
-async function evaluateInTab(url, expression) {
-  const { targetId: tab } = await cdp.send("Target.createTarget", { url: "about:blank", background: true });
-  let off = () => {};
+// A background tab of its own, so a video in the view keeps playing.
+async function withTab(fn) {
+  const { targetId: tab } = await cdp.send("Target.createTarget", {
+    url: "about:blank",
+    background: true,
+  });
+  const offs = [];
   try {
-    const { sessionId: tabSession } = await cdp.send("Target.attachToTarget", { targetId: tab, flatten: true });
+    const { sessionId } = await cdp.send("Target.attachToTarget", { targetId: tab, flatten: true });
+    const on = (method, handler) =>
+      offs.push(cdp.on(method, (params, from) => from === sessionId && handler(params)));
+    return await fn(sessionId, on);
+  } finally {
+    for (const off of offs) off();
+    await cdp.send("Target.closeTarget", { targetId: tab }).catch(() => {});
+  }
+}
+
+function evaluateInTab(url, expression) {
+  return withTab(async (tabSession, on) => {
     await cdp.send("Page.enable", {}, tabSession);
     const parsed = new Promise((resolve) => {
       const timer = setTimeout(resolve, 15000);
-      off = cdp.on("Page.domContentEventFired", (_params, from) => {
-        if (from !== tabSession) return;
+      on("Page.domContentEventFired", () => {
         clearTimeout(timer);
         resolve();
       });
     });
-    const res = await cdp.send("Page.navigate", { url }, tabSession);
-    if (res.errorText) throw new Error(`navigate failed: ${res.errorText}`);
+    await navigate(url, tabSession);
     await parsed;
-    const out = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, tabSession);
-    if (out.exceptionDetails) throw new Error(out.exceptionDetails.exception?.description ?? out.exceptionDetails.text);
+    const out = await cdp.send(
+      "Runtime.evaluate",
+      { expression, returnByValue: true, awaitPromise: true },
+      tabSession,
+    );
+    if (out.exceptionDetails) {
+      throw new Error(out.exceptionDetails.exception?.description ?? out.exceptionDetails.text);
+    }
     return out.result?.value;
-  } finally {
-    off();
-    await cdp.send("Target.closeTarget", { targetId: tab }).catch(() => {});
-  }
+  });
 }
 
 async function listVideos(url, live) {
   return (await evaluateInTab(url, LIST_VIDEOS(live))) ?? { items: [], loggedIn: false };
 }
 
-// ---------- input ----------
-
 const MOD = { alt: 1, ctrl: 2, meta: 4, shift: 8 };
 
 const NAMED_KEYS = {
   return: { key: "Enter", code: "Enter", vk: 13, text: "\r" },
-  enter: { key: "Enter", code: "Enter", vk: 13, text: "\r" },
   backspace: { key: "Backspace", code: "Backspace", vk: 8 },
   tab: { key: "Tab", code: "Tab", vk: 9 },
   escape: { key: "Escape", code: "Escape", vk: 27 },
@@ -1050,6 +951,7 @@ const NAMED_KEYS = {
   delete: { key: "Delete", code: "Delete", vk: 46 },
 };
 const KEY_ALIASES = {
+  enter: "return",
   arrowup: "up",
   arrowdown: "down",
   arrowleft: "left",
@@ -1058,49 +960,37 @@ const KEY_ALIASES = {
   del: "delete",
 };
 
-const PUNCT_CODES = {
-  "-": ["Minus", 189],
-  _: ["Minus", 189],
-  "=": ["Equal", 187],
-  "+": ["Equal", 187],
-  "[": ["BracketLeft", 219],
-  "{": ["BracketLeft", 219],
-  "]": ["BracketRight", 221],
-  "}": ["BracketRight", 221],
-  "\\": ["Backslash", 220],
-  "|": ["Backslash", 220],
-  ";": ["Semicolon", 186],
-  ":": ["Semicolon", 186],
-  "'": ["Quote", 222],
-  '"': ["Quote", 222],
-  ",": ["Comma", 188],
-  "<": ["Comma", 188],
-  ".": ["Period", 190],
-  ">": ["Period", 190],
-  "/": ["Slash", 191],
-  "?": ["Slash", 191],
-  "`": ["Backquote", 192],
-  "~": ["Backquote", 192],
-  "!": ["Digit1", 49],
-  "@": ["Digit2", 50],
-  "#": ["Digit3", 51],
-  $: ["Digit4", 52],
-  "%": ["Digit5", 53],
-  "^": ["Digit6", 54],
-  "&": ["Digit7", 55],
-  "*": ["Digit8", 56],
-  "(": ["Digit9", 57],
-  ")": ["Digit0", 48],
-};
+const PUNCT_CODES = Object.fromEntries([
+  ...[
+    ["-_", "Minus", 189],
+    ["=+", "Equal", 187],
+    ["[{", "BracketLeft", 219],
+    ["]}", "BracketRight", 221],
+    ["\\|", "Backslash", 220],
+    [";:", "Semicolon", 186],
+    ["'\"", "Quote", 222],
+    [",<", "Comma", 188],
+    [".>", "Period", 190],
+    ["/?", "Slash", 191],
+    ["`~", "Backquote", 192],
+  ].flatMap(([chars, code, vk]) => [...chars].map((ch) => [ch, [code, vk]])),
+  ...[...")!@#$%^&*("].map((ch, i) => [ch, [`Digit${i}`, 48 + i]]),
+]);
 
 function describeKey(raw) {
   if ([...raw].length === 1 && raw !== " ") {
-    const ch = raw;
-    if (/^[a-z]$/i.test(ch))
-      return { key: ch, code: `Key${ch.toUpperCase()}`, vk: ch.toUpperCase().charCodeAt(0), text: ch };
-    if (/^[0-9]$/.test(ch)) return { key: ch, code: `Digit${ch}`, vk: ch.charCodeAt(0), text: ch };
-    const p = PUNCT_CODES[ch];
-    return { key: ch, code: p ? p[0] : "", vk: p ? p[1] : 0, text: ch };
+    if (/^[a-z]$/i.test(raw)) {
+      return {
+        key: raw,
+        code: `Key${raw.toUpperCase()}`,
+        vk: raw.toUpperCase().charCodeAt(0),
+        text: raw,
+      };
+    }
+    if (/^[0-9]$/.test(raw))
+      return { key: raw, code: `Digit${raw}`, vk: raw.charCodeAt(0), text: raw };
+    const p = PUNCT_CODES[raw];
+    return { key: raw, code: p ? p[0] : "", vk: p ? p[1] : 0, text: raw };
   }
   const norm = raw.toLowerCase().replace(/[\s_-]/g, "");
   const named = NAMED_KEYS[KEY_ALIASES[norm] ?? norm] ?? NAMED_KEYS[raw];
@@ -1110,64 +1000,45 @@ function describeKey(raw) {
 
 async function sendKey(ev) {
   const k = describeKey(String(ev.key));
-  const modifiers = (ev.ctrl ? MOD.ctrl : 0) | (ev.shift ? MOD.shift : 0) | (ev.meta ? MOD.meta : 0);
+  const modifiers =
+    (ev.ctrl ? MOD.ctrl : 0) | (ev.shift ? MOD.shift : 0) | (ev.meta ? MOD.meta : 0);
   const base = { key: k.key, code: k.code, windowsVirtualKeyCode: k.vk, modifiers };
-  const typesText = k.text && !ev.ctrl && !ev.meta;
-  if (typesText) {
-    await cdp.send(
-      "Input.dispatchKeyEvent",
-      { ...base, type: "keyDown", text: k.text, unmodifiedText: k.text },
-      session,
-    );
-  } else {
-    await cdp.send("Input.dispatchKeyEvent", { ...base, type: "rawKeyDown" }, session);
-  }
+  const down =
+    k.text && !ev.ctrl && !ev.meta
+      ? { type: "keyDown", text: k.text, unmodifiedText: k.text }
+      : { type: "rawKeyDown" };
+  await cdp.send("Input.dispatchKeyEvent", { ...base, ...down }, session);
   await cdp.send("Input.dispatchKeyEvent", { ...base, type: "keyUp" }, session);
 }
 
 async function sendInput(ev) {
+  const x = Number(ev.x) * width;
+  const y = Number(ev.y) * height;
+  const mouse = (params) => cdp.send("Input.dispatchMouseEvent", { x, y, ...params }, session);
   if (ev.k === "pointer") {
-    const x = Number(ev.x) * width;
-    const y = Number(ev.y) * height;
     if (ev.type === "down") {
       pointerDown = true;
-      await cdp.send(
-        "Input.dispatchMouseEvent",
-        { type: "mousePressed", x, y, button: "left", buttons: 1, clickCount: 1 },
-        session,
-      );
+      await mouse({ type: "mousePressed", button: "left", buttons: 1, clickCount: 1 });
     } else if (ev.type === "up") {
       pointerDown = false;
-      await cdp.send(
-        "Input.dispatchMouseEvent",
-        { type: "mouseReleased", x, y, button: "left", buttons: 0, clickCount: 1 },
-        session,
-      );
+      await mouse({ type: "mouseReleased", button: "left", buttons: 0, clickCount: 1 });
     } else if (ev.type === "move") {
-      await cdp.send(
-        "Input.dispatchMouseEvent",
-        { type: "mouseMoved", x, y, button: pointerDown ? "left" : "none", buttons: pointerDown ? 1 : 0 },
-        session,
-      );
+      await mouse({
+        type: "mouseMoved",
+        button: pointerDown ? "left" : "none",
+        buttons: pointerDown ? 1 : 0,
+      });
     } else {
       throw new Error(`unknown pointer type: ${ev.type}`);
     }
   } else if (ev.k === "wheel") {
-    const x = Number(ev.x) * width;
-    const y = Number(ev.y) * height;
-    await cdp.send(
-      "Input.dispatchMouseEvent",
-      { type: "mouseWheel", x, y, deltaX: 0, deltaY: Number(ev.dy) || 0 },
-      session,
-    );
+    await mouse({ type: "mouseWheel", deltaX: 0, deltaY: Number(ev.dy) || 0 });
   } else if (ev.k === "key") {
     await sendKey(ev);
   } else {
     throw new Error(`unknown event kind: ${ev.k}`);
   }
 }
-
-// ---------- control socket ----------
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -1199,7 +1070,6 @@ async function handle(req, res) {
       if (typeof body.url !== "string") throw new Error("url is required");
       return reply(res, 200, { ok: true, streaming: await openUrl(body.url) });
     case "POST /input":
-      // The panel plays the stream: there is no page to send input to.
       if (streaming) return reply(res, 200, { ok: true });
       for (const ev of body.events ?? []) await sendInput(ev);
       return reply(res, 200, { ok: true });
@@ -1210,7 +1080,9 @@ async function handle(req, res) {
       if (typeof body.url !== "string") throw new Error("url is required");
       return reply(res, 200, { ok: true, ...(await listVideos(body.url, body.live === true)) });
     case "POST /twitch/list":
-      if (body.query !== undefined && typeof body.query !== "string") throw new Error("query must be a string");
+      if (body.query !== undefined && typeof body.query !== "string") {
+        throw new Error("query must be a string");
+      }
       return reply(res, 200, { ok: true, ...(await listTwitch(body.query?.trim())) });
     case "POST /gray":
       await setGray(typeof body.on === "boolean" ? body.on : !gray);
@@ -1219,17 +1091,18 @@ async function handle(req, res) {
       await setMuted(typeof body.on === "boolean" ? body.on : !muted);
       return reply(res, 200, { ok: true, muted });
     case "POST /resize":
-      if (typeof body.factor !== "number" || !(body.factor > 0)) throw new Error("factor is required");
+      if (typeof body.factor !== "number" || !(body.factor > 0)) {
+        throw new Error("factor is required");
+      }
       await ensurePanel();
       toPanel(`resize ${body.factor}`);
       return reply(res, 200, { ok: true });
-    case "POST /toggle":
-      if (streaming) {
-        const state = await askPanel("toggle");
-        if (state === null) throw new Error("the panel did not answer");
-        return reply(res, 200, { ok: true, paused: state === "none" ? null : state === "paused" });
-      }
-      return reply(res, 200, { ok: true, paused: await evaluate(TOGGLE_PLAY) });
+    case "POST /toggle": {
+      if (!streaming) return reply(res, 200, { ok: true, paused: await evaluate(TOGGLE_PLAY) });
+      const state = await askPanel("toggle");
+      if (state === null) throw new Error("the panel did not answer");
+      return reply(res, 200, { ok: true, paused: state === "none" ? null : state === "paused" });
+    }
     case "GET /state":
       return reply(res, 200, {
         ok: true,
@@ -1257,8 +1130,7 @@ function startServer() {
   });
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    // macOS cuts a socket path to 103 bytes without an error, so a long path
-    // binds relative to the run dir (bind happens inside listen()).
+    // macOS cuts a socket path past 103 bytes silently; bind (inside listen) relative to runDir.
     if (Buffer.byteLength(sockPath) > SUN_PATH_MAX) {
       const cwd = process.cwd();
       process.chdir(runDir);
@@ -1272,8 +1144,6 @@ function startServer() {
     }
   });
 }
-
-// ---------- lifetime ----------
 
 function waitForExit(child, ms) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
@@ -1296,7 +1166,10 @@ async function shutdown(code) {
   fs.rmSync(sockPath, { force: true });
   if (chrome && chrome.exitCode === null && chrome.signalCode === null) {
     if (cdp) {
-      await Promise.race([cdp.send("Browser.close").catch(() => {}), new Promise((r) => setTimeout(r, 2000))]);
+      await Promise.race([
+        cdp.send("Browser.close").catch(() => {}),
+        new Promise((r) => setTimeout(r, 2000)),
+      ]);
     }
     if (!(await waitForExit(chrome, 3000))) {
       chrome.kill("SIGTERM");
@@ -1320,25 +1193,21 @@ async function shutdown(code) {
 
 process.on("SIGTERM", () => shutdown(0));
 process.on("SIGINT", () => shutdown(0));
-// The mod starts the helper with stdin already at end of file, so stdin cannot
-// tell that the parent is gone. A parent that died leaves this process to pid 1.
+// The mod starts the helper with stdin at EOF, so only reparenting tells that the parent is gone.
 const parentPid = process.ppid;
 setInterval(() => {
   if (process.ppid !== parentPid) shutdown(0);
 }, 2000).unref();
 
-// ---------- main ----------
-
 async function main() {
   fs.mkdirSync(runDir, { recursive: true });
   fs.mkdirSync(profileDir, { recursive: true });
   await releaseProfile();
-  await startChrome();
+  startChrome();
   await attachPage();
   if (args.gray) await setGray(true);
   if (args.mute) await setMuted(true);
   await startServer();
-  // No frames until the mod shows the view (POST /cast).
   if (args.url !== "about:blank") {
     const loaded = waitForLoad(30000);
     await navigate(args.url);
